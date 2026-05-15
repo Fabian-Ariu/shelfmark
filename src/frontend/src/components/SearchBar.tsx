@@ -553,7 +553,7 @@ export const SearchBar = forwardRef<SearchBarHandle, SearchBarProps>(
     if (combinedMode) {
       searchModeHint = 'Combined — universal metadata across all sources';
     } else if (contentType === 'audiobook') {
-      searchModeHint = 'Audiobooks — AudioBookBay + Prowlarr sources';
+      searchModeHint = 'Audiobooks — search shows works available as audiobook editions';
     }
 
     const dynamicOptionsSession = dynamicEndpoint ? (

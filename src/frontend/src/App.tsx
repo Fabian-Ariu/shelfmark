@@ -2534,6 +2534,8 @@ function App() {
             metadataProviders={metadataProviders}
             activeMetadataProvider={effectiveMetadataProvider}
             onMetadataProviderChange={handleMetadataProviderChange}
+            supportedFormats={supportedFormats}
+            supportedAudiobookFormats={config?.supported_audiobook_formats}
             isAdmin={requestRoleIsAdmin}
           />
 

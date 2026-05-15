@@ -39,6 +39,8 @@ interface SearchSectionProps {
   metadataProviders?: MetadataProviderSummary[];
   activeMetadataProvider?: string | null;
   onMetadataProviderChange?: (provider: string) => void;
+  supportedFormats?: string[];
+  supportedAudiobookFormats?: string[];
   isAdmin?: boolean;
 }
 
@@ -71,6 +73,8 @@ export const SearchSection = ({
   metadataProviders,
   activeMetadataProvider,
   onMetadataProviderChange,
+  supportedFormats,
+  supportedAudiobookFormats,
   isAdmin = false,
 }: SearchSectionProps) => {
   return (
@@ -133,6 +137,8 @@ export const SearchSection = ({
           onMetadataProviderChange={onMetadataProviderChange}
           contentType={contentType}
           combinedMode={combinedMode}
+          supportedFormats={supportedFormats}
+          supportedAudiobookFormats={supportedAudiobookFormats}
           isAdmin={isAdmin}
           onClose={onAdvancedToggle}
         />

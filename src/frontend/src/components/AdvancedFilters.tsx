@@ -1,4 +1,4 @@
-import type { ReactNode } from 'react';
+import { useMemo, type ReactNode } from 'react';
 
 import { CONTENT_OPTIONS } from '../data/filterOptions';
 import type {
@@ -12,7 +12,11 @@ import { normalizeLanguageSelection } from '../utils/languageFilters';
 import { DropdownList } from './DropdownList';
 import { LanguageMultiSelect } from './LanguageMultiSelect';
 
-const FORMAT_TYPES = [
+// Fallback format set used when the backend hasn't populated supported_formats.
+// Production AppConfig provides config.supported_formats and
+// config.supported_audiobook_formats; the active set is then chosen based on
+// the current content type.
+const FALLBACK_EBOOK_FORMATS = [
   'pdf',
   'epub',
   'mobi',
@@ -24,6 +28,8 @@ const FORMAT_TYPES = [
   'zip',
   'rar',
 ] as const;
+
+const FALLBACK_AUDIOBOOK_FORMATS = ['m4b', 'mp3'] as const;
 
 interface AdvancedFiltersProps {
   visible: boolean;
@@ -40,6 +46,8 @@ interface AdvancedFiltersProps {
   onMetadataProviderChange?: (provider: string) => void;
   contentType?: ContentType;
   combinedMode?: boolean;
+  supportedFormats?: string[];
+  supportedAudiobookFormats?: string[];
   isAdmin?: boolean;
   onClose?: () => void;
 }
@@ -73,6 +81,8 @@ export const AdvancedFilters = ({
   onMetadataProviderChange,
   contentType = 'ebook',
   combinedMode = false,
+  supportedFormats,
+  supportedAudiobookFormats,
   isAdmin = false,
   onClose,
 }: AdvancedFiltersProps) => {
@@ -98,10 +108,24 @@ export const AdvancedFilters = ({
     onFiltersChange({ formats: nextFormats });
   };
 
-  const formatOptions = FORMAT_TYPES.map((format) => ({
-    value: format,
-    label: format.toUpperCase(),
-  }));
+  // Format options scoped to the active content type. Combined mode merges
+  // both sets (deduped, ebook-first) so the user can filter across editions.
+  const formatOptions = useMemo(() => {
+    const ebookFormats = supportedFormats ?? Array.from(FALLBACK_EBOOK_FORMATS);
+    const audiobookFormats = supportedAudiobookFormats ?? Array.from(FALLBACK_AUDIOBOOK_FORMATS);
+    let activeFormats: string[];
+    if (combinedMode) {
+      activeFormats = Array.from(new Set([...ebookFormats, ...audiobookFormats]));
+    } else if (contentType === 'audiobook') {
+      activeFormats = audiobookFormats;
+    } else {
+      activeFormats = ebookFormats;
+    }
+    return activeFormats.map((format) => ({
+      value: format,
+      label: format.toUpperCase(),
+    }));
+  }, [contentType, combinedMode, supportedFormats, supportedAudiobookFormats]);
 
   const providerOptions = metadataProviders.map((provider) => {
     const details: string[] = [];
