@@ -13,6 +13,7 @@ import type {
   SearchMode,
   SortOption,
 } from '../types';
+import { contentTypeToSearchMode } from '../utils/contentTypeToSearchMode';
 import { SearchBarAutocompleteSession } from './SearchBarAutocompleteSession';
 import { SearchBarDynamicOptionsSession } from './SearchBarDynamicOptionsSession';
 import { Tooltip } from './shared/Tooltip';
@@ -329,20 +330,17 @@ export const SearchBar = forwardRef<SearchBarHandle, SearchBarProps>(
     const handleContentTypeSelect = (type: ContentType) => {
       onContentTypeChange?.(type);
       onCombinedModeChange?.(false);
-      onSearchModeChange?.(type === 'audiobook' ? 'universal' : 'direct');
+      onSearchModeChange?.(contentTypeToSearchMode(type, false));
       setIsSelectorOpen(false);
     };
 
     const handleCombinedModeSelect = () => {
-      if (combinedMode) {
-        // Toggle off — revert to ebook-only
-        onCombinedModeChange?.(false);
-        onSearchModeChange?.('direct');
-      } else {
+      const nextCombined = !combinedMode;
+      if (nextCombined) {
         onContentTypeChange?.('ebook');
-        onCombinedModeChange?.(true);
-        onSearchModeChange?.('universal');
       }
+      onCombinedModeChange?.(nextCombined);
+      onSearchModeChange?.(contentTypeToSearchMode('ebook', nextCombined));
       setIsSelectorOpen(false);
     };
 
@@ -549,6 +547,13 @@ export const SearchBar = forwardRef<SearchBarHandle, SearchBarProps>(
     } else if (contentType === 'ebook') {
       selectorContentTypeLabel = 'books';
       selectorIcon = <BookIcon />;
+    }
+
+    let searchModeHint = "Books — Anna's Archive full-text search";
+    if (combinedMode) {
+      searchModeHint = 'Combined — universal metadata across all sources';
+    } else if (contentType === 'audiobook') {
+      searchModeHint = 'Audiobooks — AudioBookBay + Prowlarr sources';
     }
 
     const dynamicOptionsSession = dynamicEndpoint ? (
@@ -1085,6 +1090,15 @@ export const SearchBar = forwardRef<SearchBarHandle, SearchBarProps>(
             </div>
           )}
         </div>
+        {showContentTypeSelector && (
+          <div
+            className="mt-2 px-4 text-center text-xs opacity-60 transition-opacity"
+            style={{ color: 'var(--text-muted)' }}
+            aria-live="polite"
+          >
+            {searchModeHint}
+          </div>
+        )}
       </>
     );
   },

@@ -33,7 +33,7 @@ import { useActivity } from './hooks/useActivity';
 import { useAuth } from './hooks/useAuth';
 import { useDownloadTracking } from './hooks/useDownloadTracking';
 import { useMediaQuery } from './hooks/useMediaQuery';
-import { useMountEffect } from './hooks/useMountEffect';
+import { useDependencyEffect, useMountEffect } from './hooks/useMountEffect';
 import { useRealtimeStatus } from './hooks/useRealtimeStatus';
 import { useRequestPolicy } from './hooks/useRequestPolicy';
 import { useRequests } from './hooks/useRequests';
@@ -107,6 +107,11 @@ import {
   applyDirectPolicyModeToButtonState,
   applyUniversalPolicyModeToButtonState,
 } from './utils/requestPolicyUi';
+import {
+  clearStoredSearchMode,
+  getStoredSearchMode,
+  setStoredSearchMode,
+} from './utils/searchModeStorage';
 
 // eslint-disable-next-line import/no-unassigned-import -- global app stylesheet is loaded for side effects
 import './styles.css';
@@ -854,7 +859,18 @@ function App() {
     ],
   );
 
-  const effectiveSearchMode: SearchMode = config?.search_mode ?? 'direct';
+  // Per-user search-mode override, persisted in LocalStorage for instant UI
+  // continuity across reloads. The Backend keeps the source-of-truth via
+  // updateSelfUser; this state is the optimistic read cache for the current
+  // session and lets multiple users on the same browser session pick up their
+  // own preference at login time.
+  const [userSearchMode, setUserSearchMode] = useState<SearchMode | null>(null);
+
+  useDependencyEffect(() => {
+    setUserSearchMode(getStoredSearchMode(username, null));
+  }, [username]);
+
+  const effectiveSearchMode: SearchMode = userSearchMode ?? config?.search_mode ?? 'direct';
 
   // Combined mode requires universal mode, config enabled, and both content types accessible
   const combinedModeAllowed = useMemo(() => {
@@ -2078,16 +2094,28 @@ function App() {
 
   const handleSearchModeChange = useCallback(
     (nextMode: SearchMode) => {
+      const previousMode = userSearchMode;
       resetSearchResultsState();
-      setConfig((prev) => (prev ? { ...prev, search_mode: nextMode } : prev));
+      setUserSearchMode(nextMode);
+      setStoredSearchMode(username, nextMode);
       if (nextMode !== 'universal') {
         setCombinedMode(false);
       }
       updateSelfUser({ settings: { SEARCH_MODE: nextMode } })
         .then(() => loadConfig('settings-saved'))
-        .catch((err) => console.error('Failed to save search mode:', err));
+        .catch((err) => {
+          console.error('Failed to save search mode:', err);
+          // Rollback optimistic update so UI stays in sync with persisted state.
+          setUserSearchMode(previousMode);
+          if (previousMode) {
+            setStoredSearchMode(username, previousMode);
+          } else {
+            clearStoredSearchMode(username);
+          }
+          showToast('Could not save search mode preference', 'error');
+        });
     },
-    [loadConfig, resetSearchResultsState, setCombinedMode],
+    [loadConfig, resetSearchResultsState, setCombinedMode, showToast, userSearchMode, username],
   );
 
   const handleMetadataProviderChange = useCallback(
