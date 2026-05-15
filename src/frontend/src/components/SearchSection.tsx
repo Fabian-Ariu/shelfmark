@@ -106,6 +106,7 @@ export const SearchSection = ({
           allowedContentTypes={allowedContentTypes}
           combinedMode={combinedMode}
           onCombinedModeChange={onCombinedModeChange}
+          onSearchModeChange={onSearchModeChange}
           queryTargets={queryTargets}
           activeQueryTarget={activeQueryTarget}
           onQueryTargetChange={onQueryTargetChange}

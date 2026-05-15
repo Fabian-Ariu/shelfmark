@@ -6,7 +6,13 @@ import { useSearchBarAutocomplete } from '../hooks/searchBar/useSearchBarAutocom
 import { useSearchBarHoverTimeout } from '../hooks/searchBar/useSearchBarHoverTimeout';
 import { useDismiss } from '../hooks/useDismiss';
 import type { DynamicFieldOption } from '../services/api';
-import type { ContentType, MetadataSearchField, QueryTargetOption, SortOption } from '../types';
+import type {
+  ContentType,
+  MetadataSearchField,
+  QueryTargetOption,
+  SearchMode,
+  SortOption,
+} from '../types';
 import { SearchBarAutocompleteSession } from './SearchBarAutocompleteSession';
 import { SearchBarDynamicOptionsSession } from './SearchBarDynamicOptionsSession';
 import { Tooltip } from './shared/Tooltip';
@@ -35,6 +41,7 @@ interface SearchBarProps {
   allowedContentTypes?: ContentType[];
   combinedMode?: boolean;
   onCombinedModeChange?: (enabled: boolean) => void;
+  onSearchModeChange?: (mode: SearchMode) => void;
   queryTargets?: QueryTargetOption[];
   activeQueryTarget?: string;
   onQueryTargetChange?: (target: string) => void;
@@ -181,6 +188,7 @@ export const SearchBar = forwardRef<SearchBarHandle, SearchBarProps>(
       allowedContentTypes,
       combinedMode = false,
       onCombinedModeChange,
+      onSearchModeChange,
       queryTargets = [],
       activeQueryTarget = 'general',
       onQueryTargetChange,
@@ -205,8 +213,7 @@ export const SearchBar = forwardRef<SearchBarHandle, SearchBarProps>(
     const { hoverTimeoutRef: selectorHoverTimeout, clearHoverTimeout } = useSearchBarHoverTimeout();
 
     const hasMultipleContentTypes = !allowedContentTypes || allowedContentTypes.length !== 1;
-    const showContentTypeSelector =
-      searchMode !== 'direct' && !!onContentTypeChange && hasMultipleContentTypes;
+    const showContentTypeSelector = !!onContentTypeChange && hasMultipleContentTypes;
     const showQueryTargetSelector = showContentTypeSelector || queryTargets.length > 1;
     const inputPaddingClass = showQueryTargetSelector ? 'pl-3 rounded-r-full' : 'pl-4 rounded-full';
     const searchInputClass = [
@@ -322,6 +329,7 @@ export const SearchBar = forwardRef<SearchBarHandle, SearchBarProps>(
     const handleContentTypeSelect = (type: ContentType) => {
       onContentTypeChange?.(type);
       onCombinedModeChange?.(false);
+      onSearchModeChange?.(type === 'audiobook' ? 'universal' : 'direct');
       setIsSelectorOpen(false);
     };
 
@@ -329,9 +337,11 @@ export const SearchBar = forwardRef<SearchBarHandle, SearchBarProps>(
       if (combinedMode) {
         // Toggle off — revert to ebook-only
         onCombinedModeChange?.(false);
+        onSearchModeChange?.('direct');
       } else {
         onContentTypeChange?.('ebook');
         onCombinedModeChange?.(true);
+        onSearchModeChange?.('universal');
       }
       setIsSelectorOpen(false);
     };
