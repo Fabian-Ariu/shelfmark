@@ -20,6 +20,13 @@ import requests
 
 from shelfmark.core.config import config as app_config
 from shelfmark.core.logger import setup_logger
+from shelfmark.core.settings_registry import (
+    CheckboxField,
+    HeadingField,
+    SettingsField,
+    TextField,
+    register_settings,
+)
 from shelfmark.metadata_providers import (
     BookMetadata,
     DisplayField,
@@ -381,3 +388,41 @@ class AudibleProvider(MetadataProvider):
 
 
 register_provider_kwargs("audible")(_audible_kwargs)
+
+
+@register_settings(
+    "audible",
+    "Audible",
+    icon="headphones",
+    order=52,
+    group="metadata_providers",
+)
+def audible_settings() -> list[SettingsField]:
+    """Settings UI for the Audible Direct metadata provider."""
+    return [
+        HeadingField(
+            key="audible_heading",
+            title="Audible Direct",
+            description=(
+                "Audible's public catalog API. No authentication required. "
+                "Used for audiobook discovery alongside or instead of Hardcover."
+            ),
+            link_url="https://www.audible.com",
+            link_text="audible.com",
+        ),
+        CheckboxField(
+            key="AUDIBLE_ENABLED",
+            label="Enable Audible",
+            description="Use Audible Direct as an audiobook metadata provider.",
+            default=True,
+        ),
+        TextField(
+            key="AUDIBLE_REGIONS",
+            label="Audible regions",
+            description=(
+                "Comma-separated region codes to query in parallel. "
+                "Default: de,com. Supported: de, com, uk, fr, it, es, ca, au, jp."
+            ),
+            default="de,com",
+        ),
+    ]

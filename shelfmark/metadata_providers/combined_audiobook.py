@@ -22,6 +22,12 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, ClassVar
 
 from shelfmark.core.logger import setup_logger
+from shelfmark.core.settings_registry import (
+    CheckboxField,
+    HeadingField,
+    SettingsField,
+    register_settings,
+)
 from shelfmark.metadata_providers import (
     BookMetadata,
     MetadataProvider,
@@ -244,3 +250,36 @@ def _combined_kwargs() -> dict[str, Any]:
 
 
 register_provider_kwargs("combined_audiobook")(_combined_kwargs)
+
+
+@register_settings(
+    "combined_audiobook",
+    "Combined audiobook",
+    icon="layers",
+    order=53,
+    group="metadata_providers",
+)
+def combined_audiobook_settings() -> list[SettingsField]:
+    """Settings UI for the combined Hardcover + Audible audiobook provider."""
+    return [
+        HeadingField(
+            key="combined_audiobook_heading",
+            title="Combined audiobook (Hardcover + Audible)",
+            description=(
+                "Fan-out provider that queries Hardcover and Audible in parallel "
+                "and merges results by ASIN (preferred) or work-hash. Requires "
+                "both Hardcover and Audible to be enabled for full coverage; "
+                "degrades gracefully when one sub-provider is disabled or fails."
+            ),
+        ),
+        CheckboxField(
+            key="COMBINED_AUDIOBOOK_ENABLED",
+            label="Enable combined audiobook provider",
+            description=(
+                "Use the Combined audiobook (Hardcover + Audible) provider for "
+                "audiobook discovery. Select it via the audiobook provider "
+                "dropdown after enabling."
+            ),
+            default=True,
+        ),
+    ]
