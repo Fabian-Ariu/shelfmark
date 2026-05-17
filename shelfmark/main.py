@@ -2565,8 +2565,23 @@ def api_metadata_search() -> Response | tuple[Response, int]:
         if not query and not fields:
             return jsonify({"error": "Either 'query' or search field values are required"}), 400
 
+        # Pass BOOK_LANGUAGE config down as a priority-ordered list so
+        # audiobook-aware providers can filter editions without re-reading
+        # config themselves.
+        from shelfmark.core.config import config as _cfg
+        _raw_langs = _cfg.get("BOOK_LANGUAGE", "", user_id=db_user_id) or ""
+        book_languages = [
+            lang.strip() for lang in str(_raw_langs).split(",") if lang.strip()
+        ] or None
+
         options = MetadataSearchOptions(
-            query=query, limit=limit, page=page, sort=sort_order, fields=fields
+            query=query,
+            limit=limit,
+            page=page,
+            sort=sort_order,
+            fields=fields,
+            content_type=content_type or "ebook",
+            book_languages=book_languages,
         )
         search_result = provider.search_paginated(options)
 

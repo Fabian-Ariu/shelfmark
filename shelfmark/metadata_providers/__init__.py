@@ -172,6 +172,14 @@ class MetadataSearchOptions:
     limit: int = 40
     page: int = 1
     fields: dict[str, Any] = field(default_factory=dict)  # Custom search field values
+    # "ebook" (default), "audiobook", or "combined". Providers that know about
+    # audio editions (e.g. Hardcover via reading_format_id=2, Audible-Direct,
+    # CombinedAudiobook) branch on this. Providers that don't care ignore it.
+    content_type: str = "ebook"
+    # Optional language preferences in priority order, e.g. ["de", "en"].
+    # Used by audiobook-aware providers to filter editions. Falls back to
+    # BOOK_LANGUAGE config when None.
+    book_languages: list[str] | None = None
 
 
 @dataclass
@@ -709,3 +717,9 @@ with suppress(ImportError):
 
 with suppress(ImportError):
     from shelfmark.metadata_providers import googlebooks as googlebooks
+
+with suppress(ImportError):
+    from shelfmark.metadata_providers import audible as audible
+
+with suppress(ImportError):
+    from shelfmark.metadata_providers import combined_audiobook as combined_audiobook

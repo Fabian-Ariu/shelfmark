@@ -2250,6 +2250,12 @@ class HardcoverProvider(MetadataProvider):
             logger.warning("Hardcover API key not configured")
             return SearchResult(books=[], page=options.page, total_found=0, has_more=False)
 
+        # Audiobook-mode: branch into a 2-step search (Hasura blocks _ilike,
+        # so we search() first then fetch books-by-id with editions filtered
+        # to reading_format_id=2 / audio).
+        if getattr(options, "content_type", "ebook") == "audiobook" and options.query:
+            return self._search_audiobook_editions(options)
+
         # Allow pasting a Hardcover list URL directly in the search input
         list_url_parts = self._detect_list_url(options.query)
         if list_url_parts:
@@ -2437,6 +2443,256 @@ class HardcoverProvider(MetadataProvider):
         except AttributeError, KeyError, TypeError, ValueError:
             logger.exception("Hardcover search error")
             return SearchResult(books=[], page=options.page, total_found=0, has_more=False)
+
+    # --- Audiobook discovery (content_type == "audiobook") ------------------
+    # Hasura on api.hardcover.app rejects _ilike, so we can't filter books by
+    # title directly. Two-step pattern: search() returns matching book IDs,
+    # then we fetch books-by-id with editions(reading_format_id=2) for audio
+    # editions. Language code mapping is `ger`/`eng`/... (ISO 639-2/B), NOT
+    # `deu`/`eng` — Hardcover uses bibliographic codes.
+
+    _HC_LANG_CODE3: ClassVar[dict[str, str]] = {
+        "de": "ger",
+        "ger": "ger",
+        "deu": "ger",
+        "en": "eng",
+        "eng": "eng",
+        "fr": "fre",
+        "fre": "fre",
+        "fra": "fre",
+        "es": "spa",
+        "spa": "spa",
+        "it": "ita",
+        "ita": "ita",
+        "nl": "dut",
+        "dut": "dut",
+        "nld": "dut",
+        "pt": "por",
+        "por": "por",
+        "ja": "jpn",
+        "jpn": "jpn",
+        "ru": "rus",
+        "rus": "rus",
+    }
+
+    def _resolve_audio_languages(
+        self, options: MetadataSearchOptions
+    ) -> list[str]:
+        """Pick Hardcover language code3 list from book_languages preference."""
+        prefs = options.book_languages or []
+        codes: list[str] = []
+        for lang in prefs:
+            mapped = self._HC_LANG_CODE3.get((lang or "").strip().lower())
+            if mapped and mapped not in codes:
+                codes.append(mapped)
+        if not codes:
+            codes = ["ger", "eng"]
+        return codes
+
+    def _search_audiobook_editions(
+        self, options: MetadataSearchOptions
+    ) -> SearchResult:
+        """Two-step audio-edition search via Hardcover."""
+        query = options.query.strip()
+        per_page = max(min(options.limit, 25), 5)
+
+        # Step 1: typesense search → collect candidate book IDs
+        search_gql = """
+        query AudiobookSearch($query: String!, $perPage: Int!, $page: Int!) {
+            search(query: $query, query_type: "Book", per_page: $perPage, page: $page) {
+                results
+            }
+        }
+        """
+        search_vars = {
+            "query": query,
+            "perPage": per_page,
+            "page": options.page,
+        }
+        try:
+            search_result = self._execute_query(search_gql, search_vars)
+        except (AttributeError, KeyError, TypeError, ValueError):
+            logger.exception("Hardcover audiobook search step 1 failed")
+            return SearchResult(books=[], page=options.page, total_found=0, has_more=False)
+
+        if not search_result:
+            return SearchResult(books=[], page=options.page, total_found=0, has_more=False)
+
+        hits, found_count = _extract_typesense_hits(search_result)
+        book_ids: list[int] = []
+        for hit in hits:
+            item = _unwrap_hit_document(hit) or {}
+            raw_id = item.get("id")
+            if raw_id is None:
+                continue
+            try:
+                book_ids.append(int(raw_id))
+            except (TypeError, ValueError):
+                continue
+
+        if not book_ids:
+            return SearchResult(
+                books=[], page=options.page, total_found=found_count, has_more=False
+            )
+
+        # Step 2: fetch books with audio editions filter
+        lang_codes = self._resolve_audio_languages(options)
+        editions_gql = """
+        query AudiobookEditions(
+            $ids: [Int!]!
+            $langs: [String!]!
+            $maxEditions: Int!
+        ) {
+            books(where: {id: {_in: $ids}}, limit: 25) {
+                id
+                title
+                slug
+                image { url }
+                contributions(where: {contribution: {_is_null: true}}) {
+                    author { name }
+                }
+                default_audio_edition {
+                    id asin audio_seconds edition_format
+                    language { code3 }
+                    publisher { name }
+                    contributions { author { name } contribution }
+                }
+                editions(
+                    where: {
+                        reading_format_id: {_eq: 2}
+                        language: {code3: {_in: $langs}}
+                    }
+                    limit: $maxEditions
+                    order_by: {audio_seconds: desc_nulls_last}
+                ) {
+                    id asin audio_seconds edition_format release_date
+                    language { code3 }
+                    publisher { name }
+                    contributions { author { name } contribution }
+                }
+            }
+        }
+        """
+        try:
+            editions_result = self._execute_query(
+                editions_gql,
+                {"ids": book_ids, "langs": lang_codes, "maxEditions": 5},
+            )
+        except (AttributeError, KeyError, TypeError, ValueError):
+            logger.exception("Hardcover audiobook search step 2 failed")
+            return SearchResult(books=[], page=options.page, total_found=0, has_more=False)
+
+        if not editions_result:
+            return SearchResult(books=[], page=options.page, total_found=0, has_more=False)
+
+        raw_books = editions_result.get("books") or []
+        books_meta: list[BookMetadata] = []
+        for raw in raw_books:
+            book = self._parse_audiobook_record(raw)
+            if book:
+                books_meta.append(book)
+
+        # Preserve Typesense relevance ordering using book_ids index
+        order: dict[int, int] = {bid: idx for idx, bid in enumerate(book_ids)}
+
+        def rank(book: BookMetadata) -> int:
+            try:
+                return order.get(int(book.provider_id), len(order))
+            except (TypeError, ValueError):
+                return len(order)
+
+        books_meta.sort(key=rank)
+
+        return SearchResult(
+            books=books_meta,
+            page=options.page,
+            total_found=found_count or len(books_meta),
+            has_more=False,
+        )
+
+    def _parse_audiobook_record(self, raw: dict[str, Any]) -> BookMetadata | None:
+        """Map a Hardcover books row (with editions[]) to BookMetadata."""
+        book_id = raw.get("id")
+        title = (raw.get("title") or "").strip()
+        if book_id is None or not title:
+            return None
+
+        editions = raw.get("editions") or []
+        default_audio = raw.get("default_audio_edition") or None
+        if not editions and not default_audio:
+            return None
+
+        # Pick the primary edition: default_audio_edition first if matching
+        # filters, otherwise the first edition in the (already ordered) list.
+        primary = default_audio if default_audio else editions[0]
+
+        authors = [
+            (c.get("author") or {}).get("name", "")
+            for c in (raw.get("contributions") or [])
+            if (c.get("author") or {}).get("name")
+        ]
+        narrators: list[str] = []
+        for contribution in (primary.get("contributions") or []):
+            role = (contribution.get("contribution") or "").lower()
+            if "narrat" in role or "spreche" in role or "reader" in role:
+                name = (contribution.get("author") or {}).get("name", "")
+                if name and name not in narrators:
+                    narrators.append(name)
+
+        runtime_secs = primary.get("audio_seconds") or 0
+        runtime_min = int(runtime_secs // 60) if isinstance(runtime_secs, (int, float)) else 0
+        display_fields: list[DisplayField] = []
+        if runtime_min > 0:
+            hours, mins = divmod(runtime_min, 60)
+            runtime_str = f"{hours}h {mins}m" if hours else f"{mins}m"
+            display_fields.append(
+                DisplayField(label="Runtime", value=runtime_str, icon="book")
+            )
+        if narrators:
+            display_fields.append(
+                DisplayField(label="Narrator", value=", ".join(narrators[:3]))
+            )
+        editions_count = len(editions)
+        if editions_count > 1:
+            display_fields.append(
+                DisplayField(
+                    label="Editions",
+                    value=str(editions_count),
+                    icon="editions",
+                )
+            )
+
+        cover_url = (raw.get("image") or {}).get("url")
+        lang_code = ((primary.get("language") or {}).get("code3") or "").lower()
+        # Map ger→de etc. back for the rest of Shelfmark which uses ISO 639-1.
+        lang_map_reverse = {
+            "ger": "de",
+            "eng": "en",
+            "fre": "fr",
+            "spa": "es",
+            "ita": "it",
+            "dut": "nl",
+            "por": "pt",
+            "jpn": "ja",
+            "rus": "ru",
+        }
+        iso_lang = lang_map_reverse.get(lang_code)
+
+        slug = raw.get("slug")
+        source_url = _build_source_url(slug) if slug else None
+
+        return BookMetadata(
+            provider="hardcover",
+            provider_display_name="Hardcover",
+            provider_id=str(book_id),
+            title=title,
+            authors=authors,
+            cover_url=cover_url,
+            language=iso_lang,
+            publisher=(primary.get("publisher") or {}).get("name"),
+            source_url=source_url,
+            display_fields=display_fields,
+        )
 
     @cacheable(ttl_key="METADATA_CACHE_BOOK_TTL", ttl_default=600, key_prefix="hardcover:book")
     def get_book(self, book_id: str) -> BookMetadata | None:
