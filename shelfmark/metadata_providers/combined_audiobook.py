@@ -84,6 +84,13 @@ class CombinedAudiobookProvider(MetadataProvider):
     requires_auth = True  # Inherits Hardcover's auth requirement
     supported_sorts: ClassVar[tuple[SortOrder, ...]] = (SortOrder.RELEVANCE,)
 
+    # Sort options intentionally limited to RELEVANCE. Audible's catalog API
+    # returns relevance-ranked results per region (no stable cross-region
+    # sort), and Hardcover's typesense ranking is independent. A post-merge
+    # client-side sort (title/release-date) would break the work-hash tie-
+    # breaker that gives Audible priority. Backlog item: add Newest/Title
+    # as opt-in post-sorts once we have a stable cross-provider rank fusion.
+
     SUB_PROVIDERS: ClassVar[tuple[str, ...]] = ("audible", "hardcover")
 
     def __init__(self) -> None:
