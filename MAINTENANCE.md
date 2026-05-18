@@ -40,6 +40,43 @@ Tests sichern beide Stellen:
 - `tests/contentTypeToSearchMode.test.ts` (Toggle-Klick-Pfad)
 - `tests/resolveEffectiveSearchMode.test.ts` (Dispatch-Override-Pfad)
 
+### Release-Source-Resolution ist content-type-aware (Block-B 2026-05-18, Patch 0.2.3)
+
+`getBrowseSource(book)` returnt `book.source || book.provider`. Im Direct-
+Mode-eBook-Flow funktioniert das zufällig, weil `book.provider="direct_download"`
+auch ein registrierter Release-Source ist. Mit Variante-2-prime ist diese
+Identität aufgelöst: Audiobook-Hits haben `book.provider="audible"` (oder
+`hardcover`/`combined_audiobook`) — keine echten Release-Sources. Backend
+würde `Unknown release source: audible` werfen.
+
+**Architektur-Regel:** Für Download-Payloads die `release_data.source` setzen,
+ist die korrekte Utility `getReleaseSourceForContentType(book, contentType,
+defaultAudiobookSource)`. Bei `audiobook` greift `config.default_release_source_audiobook`
+(default `audiobookbay`), bei `ebook` bleibt das Legacy-Verhalten. `getBrowseSource`
+existiert noch als Helper für Stellen die explizit den Browse-Pfad meinen
+(z.B. Source-Backed Browse).
+
+Drei Call-Sites pflegen die content-type-aware Resolution:
+- `buildReleaseDataFromDirectBook(book, contentType, audiobookSource)`
+- `buildDirectRequestPayload(book, contentType, audiobookSource)`
+- `getDirectPolicyMode(book)` in App.tsx — nutzt `effectiveContentType` + `config?.default_release_source_audiobook` über die useCallback-Deps
+
+Regression-Tests in `tests/requestPayload.test.ts` (Audiobook-Integration-
+Block) und `tests/getReleaseSourceForContentType.test.ts`.
+
+### Bekanntes Backlog: Universal-Mode-eBook mit Hardcover
+
+Universal-Mode-eBook-Download (User wählt `METADATA_PROVIDER=hardcover` und
+sucht eBooks) ist **sehr wahrscheinlich vom gleichen Bug betroffen**: das
+Frontend wird `book.provider="hardcover"` als Release-Source weiterreichen,
+Backend würde `Unknown release source: hardcover` werfen. Aktuell nicht
+getriggered weil Production `SEARCH_MODE=direct` für eBook nutzt (kein
+Hardcover-Hop), aber wenn jemand auf Universal-eBook umstellt — Crash.
+
+Fix-Skizze: gleiches Pattern wie der 0.2.3-Fix, nur für eBook-Pfad. Aktuell
+nicht priorisiert weil kein User-Path es aktiv triggert. Eigene Diagnose-
+Mission wenn relevant.
+
 ---
 
 ## Recurring tasks

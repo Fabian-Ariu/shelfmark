@@ -1,9 +1,20 @@
 import type { Book, ContentType, CreateRequestPayload, Release } from '../types';
+import { getReleaseSourceForContentType } from './getReleaseSourceForContentType';
 
 export const toContentType = (value: string): ContentType => {
   return value.trim().toLowerCase() === 'audiobook' ? 'audiobook' : 'ebook';
 };
 
+/**
+ * Legacy source resolver. Returns book.source || book.provider.
+ *
+ * **Use only for ebook/direct-mode flows.** For audiobook flows the resolved
+ * `book.provider` (e.g. `audible`, `hardcover`, `combined_audiobook`) is NOT
+ * a registered release-source name and the backend will reject the download
+ * with `Unknown release source: audible`. Use
+ * `getReleaseSourceForContentType(book, contentType, defaultAudiobookSource)`
+ * instead — it honors DEFAULT_RELEASE_SOURCE_AUDIOBOOK.
+ */
 export const getBrowseSource = (book: Book): string => {
   const source = book.source || book.provider;
   if (source) {
@@ -43,12 +54,16 @@ export const buildMetadataBookRequestData = (book: Book, contentType: ContentTyp
   };
 };
 
-const buildDirectBookRequestData = (book: Book) => {
-  const source = getBrowseSource(book);
+const buildDirectBookRequestData = (
+  book: Book,
+  contentType: ContentType,
+  defaultAudiobookSource: string | null | undefined,
+) => {
+  const source = getReleaseSourceForContentType(book, contentType, defaultAudiobookSource);
   return {
     title: book.title || 'Unknown title',
     author: book.author || 'Unknown author',
-    content_type: 'ebook' as const,
+    content_type: contentType,
     provider: source,
     provider_id: book.provider_id || book.id,
     year: book.year,
@@ -94,8 +109,24 @@ export const buildReleaseDataFromMetadataRelease = (
   };
 };
 
-export const buildReleaseDataFromDirectBook = (book: Book) => {
-  const source = getBrowseSource(book);
+/**
+ * Build the release_data payload for a direct (card-level) download.
+ *
+ * @param book - Book record (search result)
+ * @param contentType - Effective content type at the time of the click.
+ *   Defaults to 'ebook' because the historical direct-mode flow was eBook-
+ *   only. Callers in audiobook flows MUST pass 'audiobook' explicitly,
+ *   otherwise the backend rejects the download with
+ *   `Unknown release source: audible`.
+ * @param defaultAudiobookSource - DEFAULT_RELEASE_SOURCE_AUDIOBOOK from
+ *   config. Required when contentType is 'audiobook'.
+ */
+export const buildReleaseDataFromDirectBook = (
+  book: Book,
+  contentType: ContentType = 'ebook',
+  defaultAudiobookSource: string | null | undefined = null,
+) => {
+  const source = getReleaseSourceForContentType(book, contentType, defaultAudiobookSource);
   return {
     source,
     source_id: book.id,
@@ -105,24 +136,35 @@ export const buildReleaseDataFromDirectBook = (book: Book) => {
     format: book.format,
     size: book.size,
     preview: book.preview,
-    content_type: 'ebook' as const,
+    content_type: contentType,
     search_mode: 'direct' as const,
   };
 };
 
-export const buildDirectRequestPayload = (book: Book): CreateRequestPayload => {
-  const bookData = buildDirectBookRequestData(book);
-  const source = getBrowseSource(book);
+/**
+ * Build a CreateRequestPayload for direct-mode actions.
+ *
+ * @param book - Book record
+ * @param contentType - See buildReleaseDataFromDirectBook. Default 'ebook'.
+ * @param defaultAudiobookSource - DEFAULT_RELEASE_SOURCE_AUDIOBOOK from config.
+ */
+export const buildDirectRequestPayload = (
+  book: Book,
+  contentType: ContentType = 'ebook',
+  defaultAudiobookSource: string | null | undefined = null,
+): CreateRequestPayload => {
+  const bookData = buildDirectBookRequestData(book, contentType, defaultAudiobookSource);
+  const source = getReleaseSourceForContentType(book, contentType, defaultAudiobookSource);
 
   // In direct mode, every result already represents a concrete downloadable release.
   // Keep request payloads release-level so admins can approve immediately while still
   // allowing alternate release selection from the same direct record.
   return {
     book_data: bookData,
-    release_data: buildReleaseDataFromDirectBook(book),
+    release_data: buildReleaseDataFromDirectBook(book, contentType, defaultAudiobookSource),
     context: {
       source,
-      content_type: 'ebook',
+      content_type: contentType,
       request_level: 'release',
     },
   };

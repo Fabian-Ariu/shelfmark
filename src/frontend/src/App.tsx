@@ -99,10 +99,10 @@ import {
   buildReleaseDataFromDirectBook,
   buildMetadataBookRequestData,
   buildReleaseDataFromMetadataRelease,
-  getBrowseSource,
   getRequestSuccessMessage,
   toContentType,
 } from './utils/requestPayload';
+import { getReleaseSourceForContentType } from './utils/getReleaseSourceForContentType';
 import {
   applyDirectPolicyModeToButtonState,
   applyUniversalPolicyModeToButtonState,
@@ -1062,9 +1062,18 @@ function App() {
 
   const getDirectPolicyMode = useCallback(
     (book: Book): RequestPolicyMode => {
-      return getSourceMode(getBrowseSource(book), 'ebook');
+      // Policy lookup needs the actual release-source name + content type.
+      // For audiobook hits, book.provider is the metadata provider (audible,
+      // hardcover, combined_audiobook), so fall through the content-type-aware
+      // resolver to the configured DEFAULT_RELEASE_SOURCE_AUDIOBOOK.
+      const source = getReleaseSourceForContentType(
+        book,
+        effectiveContentType,
+        config?.default_release_source_audiobook,
+      );
+      return getSourceMode(source, effectiveContentType);
     },
-    [getSourceMode],
+    [config?.default_release_source_audiobook, effectiveContentType, getSourceMode],
   );
 
   const getUniversalDefaultPolicyMode = useCallback((): RequestPolicyMode => {
@@ -1164,9 +1173,10 @@ function App() {
 
   const executeBookDownload = useCallback(
     async (book: Book, onBehalfOfUserId?: number): Promise<void> => {
-      const source = getBrowseSource(book);
-      const directContentType: ContentType = 'ebook';
-      const payload = buildReleaseDataFromDirectBook(book);
+      const directContentType: ContentType = effectiveContentType;
+      const audiobookSource = config?.default_release_source_audiobook ?? null;
+      const source = getReleaseSourceForContentType(book, directContentType, audiobookSource);
+      const payload = buildReleaseDataFromDirectBook(book, directContentType, audiobookSource);
       const requestStartedAtSeconds = Date.now() / 1000;
       try {
         await downloadRelease(payload, onBehalfOfUserId);
@@ -1184,7 +1194,11 @@ function App() {
             code: isApiResponseError(error) ? error.code : null,
           });
           if (requiredMode === 'request_release') {
-            openRequestConfirmation(buildDirectRequestPayload(book), [], onBehalfOfUserId);
+            openRequestConfirmation(
+              buildDirectRequestPayload(book, directContentType, audiobookSource),
+              [],
+              onBehalfOfUserId,
+            );
             await refreshRequestPolicy({ force: true });
             return;
           }
@@ -1210,6 +1224,8 @@ function App() {
       }
     },
     [
+      config?.default_release_source_audiobook,
+      effectiveContentType,
       fetchStatus,
       openRequestConfirmation,
       refreshRequestPolicy,
@@ -1442,8 +1458,9 @@ function App() {
 
   // Direct-mode action (download or release-level request based on policy).
   const handleDownload = async (book: Book): Promise<void> => {
-    const source = getBrowseSource(book);
-    const directContentType: ContentType = 'ebook';
+    const directContentType: ContentType = effectiveContentType;
+    const audiobookSource = config?.default_release_source_audiobook ?? null;
+    const source = getReleaseSourceForContentType(book, directContentType, audiobookSource);
     let mode = getDirectPolicyMode(book);
     policyTrace('direct.action:start', {
       bookId: book.id,
@@ -1485,7 +1502,7 @@ function App() {
 
     if (mode === 'request_release') {
       policyTrace('direct.action:request_modal', { bookId: book.id, mode });
-      openRequestConfirmation(buildDirectRequestPayload(book));
+      openRequestConfirmation(buildDirectRequestPayload(book, directContentType, audiobookSource));
       return;
     }
 

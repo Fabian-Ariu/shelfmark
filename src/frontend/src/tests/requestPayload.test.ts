@@ -99,6 +99,52 @@ describe('requestPayload utilities', () => {
     ).toThrow(/missing source context/);
   });
 
+  // --- Audiobook integration: all three direct-mode call sites must use the
+  // configured audiobook release source (not book.provider) when content_type
+  // is 'audiobook'. Regression guard for the v1.3.0-fork-0.2.3 fix.
+
+  const audibleBook: Book = {
+    id: 'B082BHJMFF',
+    title: 'The Martian',
+    author: 'Andy Weir',
+    provider: 'audible',
+    provider_id: 'B082BHJMFF',
+    // No book.source — Audible has no release-source identity
+  };
+
+  it('buildReleaseDataFromDirectBook routes audiobook to configured release source', () => {
+    const releaseData = buildReleaseDataFromDirectBook(audibleBook, 'audiobook', 'audiobookbay');
+    expect(releaseData.source).toBe('audiobookbay');
+    expect(releaseData.content_type).toBe('audiobook');
+    // explicitly NOT the metadata provider name
+    expect(releaseData.source).not.toBe('audible');
+  });
+
+  it('buildDirectRequestPayload routes audiobook to configured release source', () => {
+    const payload = buildDirectRequestPayload(audibleBook, 'audiobook', 'audiobookbay');
+    expect(payload.context.source).toBe('audiobookbay');
+    expect(payload.context.content_type).toBe('audiobook');
+    expect(payload.book_data?.source).toBe('audiobookbay');
+    expect(payload.book_data?.provider).toBe('audiobookbay');
+    expect(payload.book_data?.content_type).toBe('audiobook');
+    expect(payload.release_data?.source).toBe('audiobookbay');
+    expect(payload.release_data?.content_type).toBe('audiobook');
+  });
+
+  it('buildReleaseDataFromDirectBook ebook path unchanged (legacy direct_download)', () => {
+    // Default contentType is 'ebook' — call without explicit args to verify the
+    // default keeps the legacy direct-mode behavior intact.
+    const releaseData = buildReleaseDataFromDirectBook(baseBook);
+    expect(releaseData.source).toBe('direct_download');
+    expect(releaseData.content_type).toBe('ebook');
+  });
+
+  it('buildDirectRequestPayload throws audiobook without configured source', () => {
+    expect(() => buildDirectRequestPayload(audibleBook, 'audiobook', null)).toThrow(
+      /no default_release_source_audiobook/,
+    );
+  });
+
   it('builds success toast message from payload title with fallback', () => {
     const payloadWithBookTitle: CreateRequestPayload = {
       book_data: { title: 'Book From Metadata' },
