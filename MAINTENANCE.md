@@ -2,7 +2,9 @@
 
 **Repo:** github.com/Fabian-Ariu/shelfmark
 **Upstream:** github.com/calibrain/shelfmark
-**Production deploy:** `ghcr.io/fabian-ariu/shelfmark:v1.3.0-fork-0.1.0` on Mac Mini cwa-downloader (port 8085 via gluetun)
+**Production deploy:** `ghcr.io/fabian-ariu/shelfmark:v1.3.0-fork-0.2.3` on Mac Mini cwa-downloader (port 8085 via gluetun)
+**Production branch:** `feature/variante-2-prime-audiobook-discovery` (enthaelt `feature/content-type-driven-search-mode`)
+**Block-B Cut-Over:** 2026-08-30 — Audiobook-Discovery via `combined_audiobook` (Audible-Direct DE+US + Hardcover) live
 
 ---
 
@@ -92,12 +94,17 @@ git merge upstream/main
 # (we maintain a slimmer fork version — see ci(fork) commit)
 git push origin main
 
-git checkout feature/content-type-driven-search-mode
+git checkout feature/variante-2-prime-audiobook-discovery
 git rebase main
-# If conflicts in SearchBar.tsx / App.tsx: integrate carefully, run npm gates
+# If conflicts in SearchBar.tsx / App.tsx / requestPayload.ts / metadata_providers:
+# integrate carefully, run BOTH gate sets
 cd src/frontend && npm install && npm run lint && npm run typecheck && npm run test:unit && cd ../..
-git push origin feature/content-type-driven-search-mode --force-with-lease
+uv run pytest tests/ -q          # Backend-Gate: Audible/Combined-Provider-Tests
+git push origin feature/variante-2-prime-audiobook-discovery --force-with-lease
 ```
+
+Die aeltere Branch `feature/content-type-driven-search-mode` (0.1.x) ist nur noch
+Historie/Upstream-PR-Basis — Production laeuft auf der Variante-2-prime-Branch.
 
 ### After upstream-sync — release bump
 
@@ -105,15 +112,25 @@ Only needed if upstream changes touch files we patched (SearchBar.tsx, App.tsx, 
 
 ```bash
 # After rebase + green CI gates:
-git tag v1.3.0-fork-0.1.X   # bump X
-git push origin v1.3.0-fork-0.1.X
+git tag v1.3.0-fork-0.2.X   # bump X
+git push origin v1.3.0-fork-0.2.X
 
 # Wait for GHCR build (https://github.com/Fabian-Ariu/shelfmark/actions)
 # Then update production compose:
 sed -i.bak \
-  's|fabian-ariu/shelfmark:v1.3.0-fork-0.1.[0-9]*|fabian-ariu/shelfmark:v1.3.0-fork-0.1.X|' \
+  's|fabian-ariu/shelfmark:v1.3.0-fork-0.2.[0-9]*|fabian-ariu/shelfmark:v1.3.0-fork-0.2.X|' \
   ~/docker-migration/stacks/media-erweiterung/docker-compose.yml
 ~/scripts/deploy.sh media-erweiterung up -d cwa-downloader
+```
+
+Der Bind-Mount `direct_download_patched.py` muss nach jedem Upstream-Sync gegen
+die neue Source gediffed werden — sonst revertiert er Upstream-Aenderungen an
+`direct_download.py` zur Laufzeit:
+
+```bash
+git show <neuer-tag>:shelfmark/release_sources/direct_download.py > /tmp/dd_new.py
+diff -u /tmp/dd_new.py ~/docker-migration/stacks/media-erweiterung/direct_download_patched.py
+# Erwartung: NUR die drei Patch-Familien (import os / CF-Bypass / Pagination-Loop)
 ```
 
 ## Incident response
@@ -135,7 +152,7 @@ docker ps --filter name=cwa-downloader --format "{{.Image}} {{.Status}}"
 
 ### Fork-branch out of sync with production image
 
-If someone pushes to feature branch without bumping the tag, production stays on `v1.3.0-fork-0.1.0`. Check:
+If someone pushes to the feature branch without bumping the tag, production stays on the pinned tag. Check:
 
 ```bash
 docker exec cwa-downloader curl -s http://localhost:8084/api/config | python3 -c "import json,sys; d=json.load(sys.stdin); print(d['build_version'], d['release_version'])"
