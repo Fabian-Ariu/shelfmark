@@ -51,33 +51,128 @@ Identität aufgelöst: Audiobook-Hits haben `book.provider="audible"` (oder
 `hardcover`/`combined_audiobook`) — keine echten Release-Sources. Backend
 würde `Unknown release source: audible` werfen.
 
+Hinweis: `getBrowseSource` selbst ist inzwischen toter Code (keine
+Production-Call-Site mehr, nur noch Tests). Der lebende Pfad ist der
+eBook-Zweig von `utils/getReleaseSourceForContentType.ts`.
+
 **Architektur-Regel:** Für Download-Payloads die `release_data.source` setzen,
 ist die korrekte Utility `getReleaseSourceForContentType(book, contentType,
-defaultAudiobookSource)`. Bei `audiobook` greift `config.default_release_source_audiobook`
-(default `audiobookbay`), bei `ebook` bleibt das Legacy-Verhalten. `getBrowseSource`
-existiert noch als Helper für Stellen die explizit den Browse-Pfad meinen
-(z.B. Source-Backed Browse).
-
-Drei Call-Sites pflegen die content-type-aware Resolution:
-- `buildReleaseDataFromDirectBook(book, contentType, audiobookSource)`
-- `buildDirectRequestPayload(book, contentType, audiobookSource)`
-- `getDirectPolicyMode(book)` in App.tsx — nutzt `effectiveContentType` + `config?.default_release_source_audiobook` über die useCallback-Deps
+defaultAudiobookSource)` — siehe Abschnitt unten für die vollständige
+Auflösungsreihenfolge. Bei `audiobook` greift
+`config.default_release_source_audiobook`; ist der leer, wirft die Utility
+bewusst, statt still auf `book.provider` zurückzufallen.
 
 Regression-Tests in `tests/requestPayload.test.ts` (Audiobook-Integration-
 Block) und `tests/getReleaseSourceForContentType.test.ts`.
 
-### Bekanntes Backlog: Universal-Mode-eBook mit Hardcover
+### Release-Source-Resolution: eBook-Zweig + Render-Sicherheit (Block-B 2026-08-31, Patch 0.2.4)
 
-Universal-Mode-eBook-Download (User wählt `METADATA_PROVIDER=hardcover` und
-sucht eBooks) ist **sehr wahrscheinlich vom gleichen Bug betroffen**: das
-Frontend wird `book.provider="hardcover"` als Release-Source weiterreichen,
-Backend würde `Unknown release source: hardcover` werfen. Aktuell nicht
-getriggered weil Production `SEARCH_MODE=direct` für eBook nutzt (kein
-Hardcover-Hop), aber wenn jemand auf Universal-eBook umstellt — Crash.
+Der eBook-Zweig returnte `book.source || book.provider`. Für ein
+Metadata-Book (`transformMetadataToBook` setzt **kein** `book.source`,
+`book.provider` ist `hardcover`/`audible`/`combined_audiobook`) hätte das
+`Unknown release source: hardcover` beim Backend ausgelöst.
 
-Fix-Skizze: gleiches Pattern wie der 0.2.3-Fix, nur für eBook-Pfad. Aktuell
-nicht priorisiert weil kein User-Path es aktiv triggert. Eigene Diagnose-
-Mission wenn relevant.
+**Erreichbarkeit — korrigiert gegenüber der alten Backlog-Notiz:** Der Fall ist
+*nicht* auf `SEARCH_MODE=universal` beschränkt. In echtem Universal-Mode ist er
+sogar unerreichbar, weil `BookActionButton` bei `searchMode === 'universal'`
+einen `BookGetButton` (Release-Pfad) statt eines Download-Buttons rendert.
+Erreichbar ist er in **Direct-Mode-Installs** über den Header-Content-Type-
+Toggle:
+
+1. eBook-Suche in Direct-Mode → Ergebnisse stehen, `isInitialState=false`.
+2. Header-Toggle auf *Audiobook*: `useSearch` erzwingt intern `universal`
+   (`resolveEffectiveSearchMode`), die Treffer sind Metadata-Books ohne
+   `book.source`. `effectiveSearchMode` in App.tsx ist **nicht**
+   content-type-aware und bleibt `direct` → `SearchModeContext` = `direct`.
+3. Header-Toggle zurück auf *Ebook*: `effectiveContentType='ebook'`,
+   `SearchModeContext='direct'`, aber `books` sind noch die Audiobook-
+   Metadata-Books.
+
+Die `SearchBar` ruft dabei zwar `onSearchModeChange` (das in `SearchSection`
+`resetSearchResultsState` auslöst), aber die Header-Instanz bekommt diesen Prop
+absichtlich nicht: er würde bei jedem Wechsel auf "Ebook"
+`contentTypeToSearchMode('ebook', false) === 'direct'` persistieren und damit
+Universal-Mode-Installs auf Direct umstellen. Stattdessen kappt
+`handleContentTypeChange` in App.tsx die Ergebnisse selbst
+(`resetSearchResultsState` bei echtem Content-Type-Wechsel).
+
+**Architektur-Regel 1 (Auflösung):** `getReleaseSourceForContentType` löst für
+eBook in dieser Reihenfolge auf und gibt **niemals** einen Metadata-Provider-
+Namen zurück:
+
+1. `book.source` — jedes source-backed Suchergebnis nennt seine Release-Source
+   selbst (`transformSourceBackedDataToBook` setzt `source` **und** `provider`).
+2. `book.provider`, **falls** der Name (getrimmt/lowercased) in der Positiv-
+   Liste registrierter Release-Sources steht (`audiobookbay`, `direct_download`,
+   `irc`, `newznab`, `prowlarr`). Das ist der Legacy-Direct-Mode-Pfad —
+   **production-kritisch, unverändert**. Zurückgegeben wird der normalisierte
+   Name, also genau der, der validiert wurde.
+3. sonst: Error (`"<provider>" is a metadata provider, not a release source …`
+   bzw. `missing source context`).
+
+**Es gibt bewusst KEINEN `DEFAULT_RELEASE_SOURCE`-Fallback für Metadata-Books.**
+Die Direct-Payload-Builder setzen `source_id: book.id`, und `book.id` ist bei
+einem Metadata-Book `${provider}:${provider_id}` (z.B. `hardcover:12345`). Mit
+einer substituierten Source entstünde ein wohlgeformter, aber unerfüllbarer
+Task: `direct_download` interpretiert `task.task_id` als Anna's-Archive-MD5
+(`shelfmark/release_sources/direct_download.py`). Der Task würde akzeptiert,
+gequeued, ggf. vom Admin approved — und erst dann scheitern. Ein sofortiger
+Fehler ist strikt besser. Der Download-Pfad für Metadata-Books ist der
+Release-Pfad (`/api/releases` + ReleaseModal →
+`buildReleaseDataFromMetadataRelease`), der eine konkrete Release-ID auflöst.
+Der Patch leistet also ausdrücklich *"kein unauflösbarer Source-Name und kein
+unerfüllbarer Task mehr"* — **nicht** "Direct-Download für Metadata-Books".
+
+**Architektur-Regel 2 (Render-Pfad wirft nie):** `getDirectPolicyMode` läuft
+über `getDirectActionButtonState` **während des Renderings**, und es gibt in
+`src/frontend/src` **keine ErrorBoundary** — ein Throw entlädt den kompletten
+React-Baum (weiße Seite, nur Reload hilft). Deshalb zwei Einstiegspunkte:
+
+- `resolveReleaseSourceOrNull(book, contentType, defaultAudiobookSource)` →
+  `null` statt Throw. **Nur diese** Variante gehört in Render-/Policy-Pfade;
+  `getDirectPolicyMode` fällt bei `null` auf `getDefaultMode(contentType)`
+  zurück.
+- `getReleaseSourceForContentType(...)` → wirft. Nur in Payload-/Download-
+  Pfaden, und dort in `try/catch` mit `showToast` (`handleDownload`,
+  `executeBookDownload`) — `BookDownloadButton` schluckt Fehler aus `onDownload`
+  stumm, ohne Toast wäre der Button einfach tot.
+
+**Positiv-Liste statt Deny-Liste:** `KNOWN_RELEASE_SOURCES` in
+`utils/getReleaseSourceForContentType.ts` listet die *Release-Sources*, nicht
+die Metadata-Provider. Eine Deny-Liste der Metadata-Provider würde still
+brechen, sobald upstream einen Provider ergänzt (unbekannter Name → als
+Release-Source behandelt → derselbe Backend-Fehler). Die Positiv-Liste
+degradiert im umgekehrten Fall sicher: ein unbekannter Name führt zu Error bzw.
+`null`, wir schicken dem Backend nie einen unauflösbaren Namen. Die Live-Liste
+aus `/api/release-sources` wäre robuster, wird aber asynchron geladen — im
+Ladefenster wäre die Liste leer und jeder Direct-Mode-Treffer sähe aus wie ein
+Metadata-Book. **Bei einer neuen Release-Source upstream:
+`KNOWN_RELEASE_SOURCES` mit `_BUILTIN_SOURCE_MODULES` in
+`shelfmark/release_sources/__init__.py` abgleichen.**
+
+Zur Validierung von `DEFAULT_RELEASE_SOURCE`: nur der User-Override-Pfad
+(`validate_search_preference_value` in `shelfmark/config/users_settings.py`,
+aufgerufen aus `_on_save_users` und `admin_settings_routes.py`) prüft den Wert
+gegen die Registry. Der globale `search_mode`-Tab hat **keinen** `on_save`-Hook
+(`register_on_save` existiert nur für security/notifications/downloads/mirrors/
+advanced/users), und Onboarding schreibt direkt via `save_config_file`. Ein
+global gesetzter Wert ist also **nicht** garantiert eine gültige Release-Source
+— ein weiterer Grund, ihn nicht als Fallback zu missbrauchen.
+
+Call-Sites (App.tsx hat `config` überall im Scope):
+- `getDirectPolicyMode(book)` — Render-Pfad, nutzt `resolveReleaseSourceOrNull`
+- `executeBookDownload(book)` — `getReleaseSourceForContentType` +
+  `buildReleaseDataFromDirectBook` + `buildDirectRequestPayload`, in `try/catch`
+- `handleDownload(book)` — `getReleaseSourceForContentType` +
+  `buildDirectRequestPayload`, in `try/catch`
+- `buildDirectRequestPayload` löst die Source **dreimal** auf (book_data,
+  release_data, context). Alle drei müssen identische Argumente bekommen, sonst
+  lehnt das Backend mit `policy_source_mismatch` ab.
+
+Regression-Tests: `tests/getReleaseSourceForContentType.test.ts` (describes
+`ebook content_type (universal-mode / metadata provider)` und
+`resolveReleaseSourceOrNull (render path)`) sowie `tests/requestPayload.test.ts`
+(Universal-Mode-eBook-Integrationsblock).
 
 ---
 

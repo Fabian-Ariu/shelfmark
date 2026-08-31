@@ -166,8 +166,7 @@ export function useSearch(options: UseSearchOptions): UseSearchReturn {
       providerOverride?: string;
     }) => {
       const effectiveContentType = contentTypeOverride ?? contentType;
-      const requestedSearchMode =
-        (searchModeOverride ?? config?.search_mode) || 'universal';
+      const requestedSearchMode = (searchModeOverride ?? config?.search_mode) || 'universal';
       // Architektur-Regel: Audiobook-Toggle hat KEINEN Direct-Mode-Pfad.
       // Direct mode routes via /api/releases?source=direct_download (Anna's
       // Archive full-text), which has no reliable server-side audio-format
@@ -176,10 +175,7 @@ export function useSearch(options: UseSearchOptions): UseSearchReturn {
       // SearchBar's toggle handler also tries to set this via onSearchModeChange,
       // but we keep the defensive check at dispatch-time too — covers stale
       // persisted state, deep-linked URLs, race conditions.
-      const searchMode = resolveEffectiveSearchMode(
-        requestedSearchMode,
-        effectiveContentType,
-      );
+      const searchMode = resolveEffectiveSearchMode(requestedSearchMode, effectiveContentType);
 
       // In universal mode, check if we have either a query or field values
       if (searchMode === 'universal') {

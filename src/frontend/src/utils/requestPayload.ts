@@ -120,6 +120,13 @@ export const buildReleaseDataFromMetadataRelease = (
  *   `Unknown release source: audible`.
  * @param defaultAudiobookSource - DEFAULT_RELEASE_SOURCE_AUDIOBOOK from
  *   config. Required when contentType is 'audiobook'.
+ *
+ * **Source-backed books only.** `source_id` is `book.id`, which is a concrete
+ * release id for source-backed results but `${provider}:${provider_id}` for a
+ * metadata book (`transformMetadataToBook`). Metadata books therefore have no
+ * business here — `getReleaseSourceForContentType` throws for them on purpose.
+ * Their download path is `/api/releases` + ReleaseModal
+ * (`buildReleaseDataFromMetadataRelease`).
  */
 export const buildReleaseDataFromDirectBook = (
   book: Book,

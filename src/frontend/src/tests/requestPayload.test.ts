@@ -145,6 +145,45 @@ describe('requestPayload utilities', () => {
     );
   });
 
+  // --- Universal-mode ebook integration: a metadata book (no book.source,
+  // provider = metadata provider) must never produce a direct payload. The
+  // direct builders pair the source with `source_id: book.id`, which for a
+  // metadata book is `${provider}:${provider_id}` — a well-formed but
+  // unfulfillable task. Regression guard for the latent
+  // "Unknown release source: hardcover" bug.
+
+  const hardcoverBook: Book = {
+    id: 'hardcover:12345',
+    title: 'Project Hail Mary',
+    author: 'Andy Weir',
+    provider: 'hardcover',
+    provider_id: '12345',
+    // No book.source — Hardcover has no release-source identity
+  };
+
+  it('buildReleaseDataFromDirectBook refuses a metadata book instead of inventing a source', () => {
+    expect(() => buildReleaseDataFromDirectBook(hardcoverBook, 'ebook', 'audiobookbay')).toThrow(
+      /is a metadata provider, not a release source/,
+    );
+  });
+
+  it('buildDirectRequestPayload refuses a metadata book', () => {
+    expect(() => buildDirectRequestPayload(hardcoverBook, 'ebook', 'audiobookbay')).toThrow(
+      /is a metadata provider, not a release source/,
+    );
+  });
+
+  it('buildDirectRequestPayload keeps direct-mode ebook on its own source', () => {
+    // Production-critical: direct-mode hits carry a real release source and
+    // must resolve identically in all three payload slots, otherwise the
+    // backend rejects the request with policy_source_mismatch.
+    const payload = buildDirectRequestPayload(baseBook, 'ebook', 'audiobookbay');
+    expect(payload.context.source).toBe('direct_download');
+    expect(payload.release_data?.source).toBe('direct_download');
+    expect(payload.book_data?.provider).toBe('direct_download');
+    expect(payload.release_data?.source).toBe(payload.context.source);
+  });
+
   it('builds success toast message from payload title with fallback', () => {
     const payloadWithBookTitle: CreateRequestPayload = {
       book_data: { title: 'Book From Metadata' },

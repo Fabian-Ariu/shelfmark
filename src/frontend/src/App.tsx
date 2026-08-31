@@ -87,6 +87,10 @@ import { bookSupportsTargets } from './utils/bookTargetLoader';
 import { buildSearchQuery } from './utils/buildSearchQuery';
 import { wasDownloadQueuedAfterResponseError } from './utils/downloadRecovery';
 import { getDynamicOptionGroup } from './utils/dynamicFieldOptions';
+import {
+  getReleaseSourceForContentType,
+  resolveReleaseSourceOrNull,
+} from './utils/getReleaseSourceForContentType';
 import { getConfiguredMetadataProviderForContentType } from './utils/metadataProviders';
 import { getEffectiveMetadataSort } from './utils/metadataSort';
 import { isRecord } from './utils/objectHelpers';
@@ -102,7 +106,6 @@ import {
   getRequestSuccessMessage,
   toContentType,
 } from './utils/requestPayload';
-import { getReleaseSourceForContentType } from './utils/getReleaseSourceForContentType';
 import {
   applyDirectPolicyModeToButtonState,
   applyUniversalPolicyModeToButtonState,
@@ -1066,14 +1069,26 @@ function App() {
       // For audiobook hits, book.provider is the metadata provider (audible,
       // hardcover, combined_audiobook), so fall through the content-type-aware
       // resolver to the configured DEFAULT_RELEASE_SOURCE_AUDIOBOOK.
-      const source = getReleaseSourceForContentType(
+      //
+      // RENDER PATH — must never throw. getDirectActionButtonState calls this
+      // during render and there is no ErrorBoundary in this app, so a throw
+      // would unmount the whole tree (white page, reload-only recovery).
+      // A book whose release source cannot be resolved (metadata book rendered
+      // while the search-mode context still says "direct", or a missing
+      // audiobook default) falls back to the content-type default mode; the
+      // throwing resolver in the download/request path then produces a real,
+      // user-visible error for the actual click.
+      const source = resolveReleaseSourceOrNull(
         book,
         effectiveContentType,
         config?.default_release_source_audiobook,
       );
+      if (!source) {
+        return getDefaultMode(effectiveContentType);
+      }
       return getSourceMode(source, effectiveContentType);
     },
-    [config?.default_release_source_audiobook, effectiveContentType, getSourceMode],
+    [config?.default_release_source_audiobook, effectiveContentType, getDefaultMode, getSourceMode],
   );
 
   const getUniversalDefaultPolicyMode = useCallback((): RequestPolicyMode => {
@@ -1175,8 +1190,19 @@ function App() {
     async (book: Book, onBehalfOfUserId?: number): Promise<void> => {
       const directContentType: ContentType = effectiveContentType;
       const audiobookSource = config?.default_release_source_audiobook ?? null;
-      const source = getReleaseSourceForContentType(book, directContentType, audiobookSource);
-      const payload = buildReleaseDataFromDirectBook(book, directContentType, audiobookSource);
+      let source: string;
+      let payload: ReturnType<typeof buildReleaseDataFromDirectBook>;
+      try {
+        source = getReleaseSourceForContentType(book, directContentType, audiobookSource);
+        payload = buildReleaseDataFromDirectBook(book, directContentType, audiobookSource);
+      } catch (error) {
+        // No resolvable release source (metadata book in a direct payload path,
+        // or audiobook without DEFAULT_RELEASE_SOURCE_AUDIOBOOK). Fail visibly
+        // instead of queueing a task the backend cannot fulfil.
+        console.error('Download aborted, unresolved release source:', error);
+        showToast(getErrorMessage(error, 'Failed to queue download'), 'error');
+        return;
+      }
       const requestStartedAtSeconds = Date.now() / 1000;
       try {
         await downloadRelease(payload, onBehalfOfUserId);
@@ -1460,7 +1486,16 @@ function App() {
   const handleDownload = async (book: Book): Promise<void> => {
     const directContentType: ContentType = effectiveContentType;
     const audiobookSource = config?.default_release_source_audiobook ?? null;
-    const source = getReleaseSourceForContentType(book, directContentType, audiobookSource);
+    let source: string;
+    try {
+      source = getReleaseSourceForContentType(book, directContentType, audiobookSource);
+    } catch (error) {
+      // See executeBookDownload: unresolvable release source → visible error,
+      // never a silently dead button.
+      console.error('Direct action aborted, unresolved release source:', error);
+      showToast(getErrorMessage(error, 'Failed to queue download'), 'error');
+      return;
+    }
     let mode = getDirectPolicyMode(book);
     policyTrace('direct.action:start', {
       bookId: book.id,
@@ -2135,6 +2170,24 @@ function App() {
     [loadConfig, resetSearchResultsState, setCombinedMode, showToast, userSearchMode, username],
   );
 
+  // Content-type switch from the header (the only toggle reachable while
+  // results are on screen). SearchBar also calls onSearchModeChange here, but
+  // the header instance deliberately does not get that prop: it would persist
+  // SEARCH_MODE=direct for every universal-mode install that switches back to
+  // "Ebook". What the switch MUST do is drop the previous content type's
+  // results — otherwise audiobook metadata books (no book.source, provider
+  // "audible") stay on screen while the search-mode context says "direct", and
+  // every direct-mode code path downstream sees a book it cannot resolve.
+  const handleContentTypeChange = useCallback(
+    (nextContentType: ContentType) => {
+      if (nextContentType !== effectiveContentType) {
+        resetSearchResultsState();
+      }
+      setContentType(nextContentType);
+    },
+    [effectiveContentType, resetSearchResultsState, setContentType],
+  );
+
   const handleMetadataProviderChange = useCallback(
     (provider: string) => {
       if (effectiveCombinedMode) {
@@ -2460,7 +2513,7 @@ function App() {
           onShowToast={showToast}
           onRemoveToast={removeToast}
           contentType={effectiveContentType}
-          onContentTypeChange={setContentType}
+          onContentTypeChange={handleContentTypeChange}
           allowedContentTypes={allowedContentTypes}
           combinedMode={effectiveCombinedMode}
           onCombinedModeChange={combinedModeAllowed ? setCombinedMode : undefined}
