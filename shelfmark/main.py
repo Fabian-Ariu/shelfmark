@@ -2853,6 +2853,7 @@ def api_releases() -> Response | tuple[Response, int]:
                     manual_query=query_text if source_query_filters is not None else manual_query,
                     indexers=indexers,
                     source_filters=source_query_filters,
+                    page=requested_page,
                 )
 
                 if plan.source_filters is not None:
@@ -2919,6 +2920,15 @@ def api_releases() -> Response | tuple[Response, int]:
         )
         browse_filters = _parse_search_filters_from_request()
         has_browse_filters = bool(query_text or any(vars(browse_filters).values()))
+
+        # 1-based result page for source-native browse searches, mirroring
+        # /api/metadata/search. Deliberately NOT part of SearchFilters: it is a cursor,
+        # not a query predicate, and a default-1 field there would make
+        # has_browse_filters always true.
+        try:
+            requested_page = max(1, int(request.args.get("page", 1)))
+        except ValueError:
+            requested_page = 1
 
         source_query_filters = None
         is_source_provider = bool(provider) and source_results_are_releases(provider)
@@ -3028,9 +3038,16 @@ def api_releases() -> Response | tuple[Response, int]:
             book_dict["cover_url"] = transform_cover_url(book_dict["cover_url"], cache_id)
 
         search_info = {}
+        page_used = requested_page
+        has_more = False
         for source_name, source_instance in source_instances.items():
             if hasattr(source_instance, "last_search_type") and source_instance.last_search_type:
                 search_info[source_name] = {"search_type": source_instance.last_search_type}
+            if getattr(source_instance, "last_search_has_more", False):
+                has_more = True
+            source_page = getattr(source_instance, "last_search_page", None)
+            if isinstance(source_page, int) and source_page > 0:
+                page_used = source_page
 
         response = {
             "releases": releases_data,
@@ -3038,6 +3055,10 @@ def api_releases() -> Response | tuple[Response, int]:
             "sources_searched": sources_to_search,
             "column_config": column_config,
             "search_info": search_info,
+            # Paging for source-native browse searches; sources without a paging
+            # concept report page 1 / has_more False.
+            "page": page_used,
+            "has_more": has_more,
         }
 
         if errors:

@@ -481,6 +481,7 @@ function App() {
     updateAdvancedFilters,
     handleSearch,
     handleResetSearch,
+    cancelPendingLoadMore,
     searchFieldValues,
     updateSearchFieldValue,
     searchFieldLabels,
@@ -529,12 +530,15 @@ function App() {
   const [activeResultsSort, setActiveResultsSort] = useState('');
 
   const resetSearchResultsState = useCallback(() => {
+    // cancelPendingLoadMore() first: a direct-mode page can be 45-60s in flight, and
+    // without dropping it the emptied result list refills itself when that page lands.
+    cancelPendingLoadMore();
     setBooks([]);
     setSelectedBook(null);
     setReleaseBook(null);
     setActiveResultsSort('');
     clearTracking();
-  }, [clearTracking, setBooks]);
+  }, [cancelPendingLoadMore, clearTracking, setBooks]);
 
   const loadAdminUsers = useCallback(async () => {
     if (!isAuthenticated || !authIsAdmin || !requestRoleIsAdmin) {

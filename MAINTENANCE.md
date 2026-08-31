@@ -273,30 +273,80 @@ cp shelfmark/release_sources/direct_download.py \
    ~/docker-migration/stacks/media-erweiterung/direct_download_patched.py
 ```
 
+**Reihenfolge beim Rollout des bedarfsgesteuerten Nachladens (2026-08-31).** Der
+Bind-Mount wirkt beim naechsten Container-Restart — also spaetestens beim taeglichen
+04:00-Restart —, das Image dagegen erst nach `deploy`. Diese Version von
+`direct_download.py` stellt den Browse-Pfad auf **eine Seite pro Request** um. Auf dem
+alten Image (`v1.3.0-fork-0.2.4`) kennt `ReleaseSearchPlan` kein `page`-Feld, der
+`getattr`-Fallback bleibt auf Seite 1, und `main.py`/Frontend kennen weder `has_more`
+noch einen Button: die Browse-Suche liefert dort also **eine** Seite statt bis zu
+`AA_MAX_PAGES`, ohne Moeglichkeit umzublaettern. Mit dem Produktionswert
+`AA_MAX_PAGES=1` ist das folgenlos (es war ohnehin eine Seite). Wer den Wert vorher
+hochsetzt, verlangsamt nur die Release-Suche, ohne dass die Browse-Suche mehr liefert.
+Deshalb: **erst Image bauen und deployen, dann an Settings drehen** — und
+`AA_MAX_PAGES` fuer dieses Feature gar nicht anfassen, dafuer gibt es
+`AA_BROWSE_MAX_PAGES` (siehe unten).
+
 Pagination-relevante Settings. Beide sind in `shelfmark/config/settings.py`
 (Tab *Mirrors*, Abschnitt Anna's Archive) als `NumberField` registriert, also in
 der Settings-UI sichtbar und per ENV ueberschreibbar wie jedes andere Setting:
 
 | Setting / ENV | Default | Wirkung |
 | --- | --- | --- |
-| `AA_MAX_PAGES` | 5 | Obergrenze der AA-Suchseiten pro Suche |
-| `AA_SEARCH_BUDGET_SECONDS` | 90 | Zeitbudget; ist es beim Start einer weiteren Seite ueberschritten, kommen Teilergebnisse zurueck. `0` schaltet es ab. Page 1 ist nie budgetiert (sonst 503 statt Treffer). |
+| `AA_MAX_PAGES` | 5 | **Nur Release-Suche** (ISBN/Titel+Autor, `search_books()`). Die hat keinen Pager, holt bis zu so viele Seiten am Stueck und zahlt pro Seite einen Solve. Produktion steht bewusst auf `1`. |
+| `AA_BROWSE_MAX_PAGES` | 20 | **Nur Browse-Suche** (`?source=direct_download&page=N`). Reine Leitplanke gegen einen Client, der auf Seite 400 springt — geholt wird pro Request genau eine Seite. `1` schaltet den Load-More-Button ab. |
+| `AA_SEARCH_BUDGET_SECONDS` | 90 | Zeitbudget der Release-Suche; ist es beim Start einer weiteren Seite ueberschritten, kommen Teilergebnisse zurueck. `0` schaltet es ab. Page 1 ist nie budgetiert (sonst 503 statt Treffer). |
 
-`_int_setting()` in `direct_download.py` liest beide ueber `config.get()` und
+**Warum zwei Keys statt einem:** bis 2026-08-31 klammerte der Browse-Zweig an
+`AA_MAX_PAGES`. Mit dem Produktionswert `AA_MAX_PAGES=1` wurde `page` auf 1 geclamped
+und `has_more = ... and page < max_pages` war `1 < 1` — der Load-More-Button konnte
+nie erscheinen, das Feature war in genau der Konfiguration tot, in der es ausgeliefert
+wird. Hochsetzen haette den Button gebracht **und** die Release-Suche wieder auf bis zu
+N Solves (gemessen 120-164s) verlangsamt. Die beiden Groessen haben nichts miteinander
+zu tun: `AA_MAX_PAGES` steuert Arbeit, die pro Request ungefragt anfaellt,
+`AA_BROWSE_MAX_PAGES` nur, wie weit ein User klicken darf. `AA_MAX_PAGES=1` bleibt
+damit richtig und der Pager funktioniert trotzdem — die Produktions-ENV muss fuer
+dieses Feature **nicht** angefasst werden.
+
+`_int_setting()` in `direct_download.py` liest alle drei ueber `config.get()` und
 faellt nur dann auf `os.environ` zurueck, wenn die Registry den Key nicht kennt.
 Dieser Fallback ist kein Stilbruch, sondern haelt die Bind-Mount-Datei auf einem
 aelteren Image funktionsfaehig: dort kennt die mitgelieferte Registry
 `AA_MAX_PAGES` noch nicht und `config.get()` wuerde still den Default liefern.
 
-Abbruchheuristik: der Loop stoppt, sobald eine Seite `_PAGE_LENGTH_SLACK` Zeilen
-kuerzer ist als die laengste bisher gesehene Seite — vorher zahlte jede Suche
-einen ueberfluessigen Leer-Fetch, also einen zusaetzlichen DDoS-Guard-Solve.
-Gezaehlt werden **von AA gelieferte** Ergebniszeilen (`_is_result_row()`, rein
-strukturell), nicht erfolgreich geparste Records: `_parse_search_result_row()`
-liefert regulaer `None` fuer Werbezeilen und fuer Zeilen ohne Publisher-/Jahr-/
-Sprach-Span, und eine einzige solche Zeile haette eine volle Seite als "kurz"
-erscheinen lassen. Die Seitengroesse wird gemessen, nicht angenommen — es gibt
-keine hartkodierte AA-Seitengroesse mehr.
+Bedarfsgesteuertes Nachladen (Browse-Pfad): `GET /api/releases?source=direct_download&...&page=N`
+holt genau Seite `N` ueber `search_books_page()` — ein Request, ein DDoS-Guard-Solve.
+Die Antwort traegt zusaetzlich `page` und `has_more` (gleicher Contract wie
+`/api/metadata/search`); das Frontend haengt die Treffer an und dedupliziert per
+`book.id`. Der Sprach-Fallback (Retry ohne `lang`) laeuft nur auf Seite 1 und setzt
+dann `has_more=false`, weil eine Fallback-Seite eine andere Query beantwortet.
+`search_books()` mit seiner Mehrseiten-Schleife bleibt fuer die Release-Suche.
+
+Abbruchheuristik: der Loop stoppt, sobald eine Seite deutlich kuerzer ist als die
+laengste bisher gesehene Seite — vorher zahlte jede Suche einen ueberfluessigen
+Leer-Fetch, also einen zusaetzlichen DDoS-Guard-Solve. Gezaehlt werden **von AA
+gelieferte** Ergebniszeilen (`_is_result_row()`, rein strukturell), nicht erfolgreich
+geparste Records: `_parse_search_result_row()` liefert regulaer `None` fuer
+Werbezeilen und fuer Zeilen ohne Publisher-/Jahr-/Sprach-Span. Die Seitengroesse wird
+gemessen, nicht angenommen.
+
+Der Slack ist seit 2026-08-31 proportional (`_page_length_slack()`: 10 % der Referenz,
+mindestens 2 Zeilen). Feste 2 Zeilen reichten fuer eine einzelne kaputte `<tr>`, nicht
+fuer die drei bis fuenf Werbezeilen, die AA in manche Treffersaetze streut.
+
+`_observed_aa_page_size` — die Grenzen ehrlich: fuer den Einzelseiten-Abruf gibt es
+keine call-lokale Referenz, deshalb merkt sich das **Modul** die laengste je gesehene
+Seite. Dieser Wert ist prozessweit, monoton und wird nie zurueckgesetzt, gilt also
+ueber Queries und User eines Workers hinweg. Die frueher hier stehende Zusicherung
+"verschluckt nie Ergebnisse" war falsch: liefert Query A eine 100-Zeilen-Seite und
+Query B eine volle Seite mit mehr als 10 % nicht zaehlbaren Zeilen, meldet Seite 1 von
+B `has_more=false`. Der Fehler ist nach oben durch AAs Seitengroesse begrenzt (eine
+Seite kann sie nicht ueberschreiten), dafuer ist der proportionale Slack bemessen —
+null ist er nicht. Ohne jede Messung dient `_AA_MIN_PLAUSIBLE_PAGE_SIZE = 48` als
+Referenz (Produktion hat eine Browse-Seite mit 48 Ergebniszeilen geliefert, die
+Fixtures modellieren 100). Frueher galt dort `Seite nicht leer => has_more`, was nach
+jedem Container-Restart (`gunicorn --workers 1`) die erste Suche mit einem Button auf
+eine garantiert leere Seite 2 schickte — 45-60 s Warten fuer nichts.
 
 ### VPN-Egress: der externe Bypasser waere ein Leck
 

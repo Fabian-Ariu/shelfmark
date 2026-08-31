@@ -1668,15 +1668,29 @@ def mirror_settings() -> list[SettingsField]:
         ),
         NumberField(
             key="AA_MAX_PAGES",
-            label="Search Result Pages",
+            label="Release Search Pages",
             description=(
-                "How many Anna's Archive result pages a search may fetch. Each extra page is "
-                "another request through the protection challenge, so higher values mean more "
-                "results but slower searches."
+                "How many Anna's Archive result pages the release search (ISBN / title+author) "
+                "fetches in one go. That search has no pager, so every page here is spent "
+                "without being asked for, and each one is another request through the "
+                "protection challenge. Does not affect browse search, which fetches one page "
+                "per request -- see Browse Page Limit."
             ),
             default=5,
             min_value=1,
             max_value=20,
+        ),
+        NumberField(
+            key="AA_BROWSE_MAX_PAGES",
+            label="Browse Page Limit",
+            description=(
+                "Highest result page the browse search (the Load Next Page button) may request. "
+                "Browse fetches exactly one page per click, so this only bounds how far you can "
+                "page, not how long a single search takes. 1 disables the button."
+            ),
+            default=20,
+            min_value=1,
+            max_value=100,
         ),
         NumberField(
             key="AA_SEARCH_BUDGET_SECONDS",

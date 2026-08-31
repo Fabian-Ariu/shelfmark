@@ -6,6 +6,7 @@ import { searchBooks, searchMetadata, AuthenticationError } from '../services/ap
 import type { Book, AppConfig, AdvancedFilterState, ContentType, SearchMode } from '../types';
 import { LANGUAGE_OPTION_DEFAULT } from '../utils/languageFilters';
 import { resolveEffectiveSearchMode } from '../utils/resolveEffectiveSearchMode';
+import { appendUniqueBooks, canLoadMoreDirect, performDirectLoadMore } from './useSearch.helpers';
 
 const DEFAULT_FORMAT_SELECTION = DEFAULT_SUPPORTED_FORMATS;
 
@@ -41,12 +42,14 @@ interface UseSearchReturn {
     providerOverride?: string;
   }) => Promise<void>;
   handleResetSearch: (config: AppConfig | null) => void;
+  /** Drop the current search incl. a page still in flight; see the implementation. */
+  cancelPendingLoadMore: () => void;
   resetSortFilter: () => void;
   // Universal mode search field values
   searchFieldValues: SearchFieldValues;
   updateSearchFieldValue: (key: string, value: string | number | boolean, label?: string) => void;
   searchFieldLabels: Record<string, string>;
-  // Pagination (universal mode only)
+  // Pagination (universal and direct mode)
   hasMore: boolean;
   isLoadingMore: boolean;
   loadMore: (config: AppConfig | null, searchMode?: SearchMode) => Promise<void>;
@@ -85,7 +88,7 @@ export function useSearch(options: UseSearchOptions): UseSearchReturn {
   const [searchFieldValues, setSearchFieldValues] = useState<SearchFieldValues>({});
   const [searchFieldLabels, setSearchFieldLabels] = useState<Record<string, string>>({});
 
-  // Pagination state (universal mode only)
+  // Pagination state (universal and direct mode)
   const [currentPage, setCurrentPage] = useState(1);
   const [hasMore, setHasMore] = useState(false);
   const [isLoadingMore, setIsLoadingMore] = useState(false);
@@ -100,7 +103,33 @@ export function useSearch(options: UseSearchOptions): UseSearchReturn {
     fieldValues: SearchFieldValues;
     providerOverride?: string;
     contentType: ContentType;
+    // Direct mode: the full built query string (query + isbn/author/title/lang/
+    // content/format/sort). `query` alone would drop every filter on the next page.
+    rawQuery?: string;
   } | null>(null);
+
+  // Bumped by every new search. A direct-mode page can be in flight for 45-60s and
+  // the search bar stays usable meanwhile, so loadMore checks this after its await
+  // and drops results that belong to a search the user has already replaced.
+  const searchGenerationRef = useRef(0);
+
+  /**
+   * Throw away the search currently on screen, including one still in flight.
+   *
+   * Bumping the generation is the load-bearing part: a direct-mode page can be 45-60s
+   * in flight, and without the bump its result would still be appended after the list
+   * was cleared -- the emptied results would reappear on their own, holding page 2
+   * without page 1. Every caller that clears `books` must call this (App.tsx clears
+   * them on logo click, search-mode switch, content-type switch and logout).
+   */
+  const cancelPendingLoadMore = useCallback(() => {
+    searchGenerationRef.current += 1;
+    lastSearchParamsRef.current = null;
+    setIsLoadingMore(false);
+    setHasMore(false);
+    setCurrentPage(1);
+    setTotalFound(0);
+  }, []);
 
   const updateAdvancedFilters = useCallback((updates: Partial<AdvancedFilterState>) => {
     setAdvancedFilters((prev) => ({ ...prev, ...updates }));
@@ -166,6 +195,7 @@ export function useSearch(options: UseSearchOptions): UseSearchReturn {
       providerOverride?: string;
     }) => {
       const effectiveContentType = contentTypeOverride ?? contentType;
+      searchGenerationRef.current += 1;
       const requestedSearchMode = (searchModeOverride ?? config?.search_mode) || 'universal';
       // Architektur-Regel: Audiobook-Toggle hat KEINEN Direct-Mode-Pfad.
       // Direct mode routes via /api/releases?source=direct_download (Anna's
@@ -255,20 +285,42 @@ export function useSearch(options: UseSearchOptions): UseSearchReturn {
       if (!query) {
         setBooks([]);
         setLastSearchQuery('');
+        setHasMore(false);
+        setTotalFound(0);
+        setCurrentPage(1);
+        lastSearchParamsRef.current = null;
         return;
       }
       setIsSearching(true);
       setLastSearchQuery(query);
+      // Reset pagination for new search
+      setCurrentPage(1);
+      setHasMore(false);
+      setTotalFound(0);
 
       try {
-        const results = await searchBooks(query);
+        const result = await searchBooks(query, 1);
 
-        if (results.length > 0) {
-          setBooks(results);
+        if (result.books.length > 0) {
+          setBooks(result.books);
+          setHasMore(result.hasMore);
+          // Store params for loadMore. AA reports no total, so totalFound stays 0
+          // and the "showing X of Y" line stays hidden.
+          lastSearchParamsRef.current = {
+            query: '',
+            sort: '',
+            fieldValues: {},
+            contentType: effectiveContentType,
+            rawQuery: query,
+          };
         } else {
+          setHasMore(false);
+          lastSearchParamsRef.current = null;
           showToast('No results found', 'error');
         }
       } catch (error) {
+        setHasMore(false);
+        lastSearchParamsRef.current = null;
         if (error instanceof AuthenticationError) {
           handleSearchError(error, 'Search failed');
         } else {
@@ -310,22 +362,18 @@ export function useSearch(options: UseSearchOptions): UseSearchReturn {
       setSearchFieldValues({});
       setSearchFieldLabels({});
 
-      // Reset pagination
-      setCurrentPage(1);
-      setHasMore(false);
-      setTotalFound(0);
+      // Reset pagination and drop a page that is still in flight
+      cancelPendingLoadMore();
       setResultsSourceUrl(undefined);
       setResultsSourceTitle(undefined);
-      lastSearchParamsRef.current = null;
     },
-    [onSearchReset],
+    [cancelPendingLoadMore, onSearchReset],
   );
 
-  // Load more results (universal mode pagination)
+  // Load more results (universal metadata pages / direct AA result pages)
   const loadMore = useCallback(
     async (config: AppConfig | null, searchModeOverride?: SearchMode) => {
       const searchMode = (searchModeOverride ?? config?.search_mode) || 'universal';
-      if (searchMode !== 'universal') return;
       if (!lastSearchParamsRef.current) return;
       if (isLoadingMore || !hasMore) return;
 
@@ -335,8 +383,34 @@ export function useSearch(options: UseSearchOptions): UseSearchReturn {
         fieldValues,
         providerOverride,
         contentType: searchContentType,
+        rawQuery,
       } = lastSearchParamsRef.current;
       const nextPage = currentPage + 1;
+      const generation = searchGenerationRef.current;
+
+      // Direct mode: one more Anna's Archive page, fetched only because the user
+      // asked for it (each page is one DDoS-Guard solve, ~45-60s).
+      if (searchMode !== 'universal') {
+        if (!canLoadMoreDirect({ hasMore, isLoadingMore, rawQuery }) || !rawQuery) return;
+
+        setIsLoadingMore(true);
+        try {
+          await performDirectLoadMore({
+            rawQuery,
+            nextPage,
+            fetchPage: searchBooks,
+            isStale: () => searchGenerationRef.current !== generation,
+            setBooks,
+            setHasMore,
+            setCurrentPage,
+            showToast,
+            onError: handleSearchError,
+          });
+        } finally {
+          setIsLoadingMore(false);
+        }
+        return;
+      }
 
       setIsLoadingMore(true);
 
@@ -350,8 +424,9 @@ export function useSearch(options: UseSearchOptions): UseSearchReturn {
           searchContentType,
           providerOverride,
         );
+        if (searchGenerationRef.current !== generation) return;
         if (result.books.length > 0) {
-          setBooks((prev) => [...prev, ...result.books]);
+          setBooks((prev) => appendUniqueBooks(prev, result.books));
           setHasMore(result.hasMore);
           setCurrentPage(nextPage);
         } else {
@@ -363,7 +438,7 @@ export function useSearch(options: UseSearchOptions): UseSearchReturn {
         setIsLoadingMore(false);
       }
     },
-    [currentPage, hasMore, isLoadingMore, handleSearchError],
+    [currentPage, hasMore, isLoadingMore, handleSearchError, showToast],
   );
 
   return {
@@ -380,12 +455,13 @@ export function useSearch(options: UseSearchOptions): UseSearchReturn {
     updateAdvancedFilters,
     handleSearch,
     handleResetSearch,
+    cancelPendingLoadMore,
     resetSortFilter,
     // Universal mode search field values
     searchFieldValues,
     updateSearchFieldValue,
     searchFieldLabels,
-    // Pagination (universal mode only)
+    // Pagination (universal and direct mode)
     hasMore,
     isLoadingMore,
     loadMore,

@@ -479,6 +479,8 @@ export interface ReleasesResponse {
   errors?: string[];
   column_config?: ReleaseColumnConfig | null; // Plugin-driven column configuration
   search_info?: Record<string, SourceSearchInfo>; // Per-source search metadata
+  page?: number; // 1-based result page (source-native browse searches)
+  has_more?: boolean; // Another result page can be requested
 }
 
 // Search status update from WebSocket (for ReleaseModal loading state)

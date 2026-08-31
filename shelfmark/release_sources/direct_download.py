@@ -7,7 +7,7 @@ import re
 import time
 from dataclasses import replace
 from http import HTTPStatus
-from typing import TYPE_CHECKING, ClassVar, NoReturn, TypedDict
+from typing import TYPE_CHECKING, ClassVar, NamedTuple, NoReturn, TypedDict
 from urllib.parse import quote, urlparse
 
 import requests
@@ -48,15 +48,32 @@ if TYPE_CHECKING:
 
 logger = setup_logger(__name__)
 
-# Slack for the "a shorter page is the last page" heuristic in search_books().
-# AA's real page size is not hardcoded anywhere -- it is measured from the pages we
-# actually receive -- but a single malformed <tr> would still make a full page look
-# one row short. Being wrong in this direction costs one extra fetch; breaking too
-# early would silently truncate the result set, which is far worse.
+# Slack for the "a shorter page is the last page" heuristic. AA's real page size is
+# not hardcoded anywhere -- it is measured from the pages we actually receive -- but
+# rows AA renders differently (ads, malformed <tr>) make a full page look short. The
+# slack is proportional to the reference length with an absolute floor: a fixed +2 was
+# enough for a single malformed row but not for the handful of ad rows AA injects into
+# some result sets, and undercounting by more than the slack truncates the list.
+# Being wrong in this direction costs one extra fetch; breaking too early hides hits.
 _PAGE_LENGTH_SLACK = 2
+_PAGE_LENGTH_SLACK_RATIO = 0.1
+
+# Fallback reference length used only until this process has measured a real AA page
+# (see _observed_aa_page_size). Rationale for the value: production has served a
+# single browse page carrying 48 result rows, and the fixtures model AA's page size as
+# 100 -- a full AA page is therefore never shorter than this. Too low costs one wasted
+# fetch at the end of a list; too high would hide page 2 of the FIRST query in a fresh
+# worker, which is why it sits below every page length ever observed here.
+_AA_MIN_PLAUSIBLE_PAGE_SIZE = 48
 
 # A result row carries at least this many <td>s; see _is_result_row().
 _RESULT_ROW_MIN_CELLS = 11
+
+# Highest browse page a client may request (AA_BROWSE_MAX_PAGES). Pure guard rail:
+# the browse path fetches one page per request, so this bounds how far the pager can
+# walk, not how much work a single request does. Kept separate from AA_MAX_PAGES on
+# purpose -- see the comment at the browse branch in DirectDownloadSource.search().
+_AA_BROWSE_MAX_PAGES_DEFAULT = 20
 
 
 def _int_setting(name: str, default: int, *, minimum: int) -> int:
@@ -368,21 +385,75 @@ class SearchUnavailableError(SourceUnavailableError):
     """Raised when Anna's Archive cannot be reached via any mirror/DNS."""
 
 
-def search_books(query: str, filters: SearchFilters) -> list[BrowseRecord]:
-    """Search for books matching the query.
+class AASearchPage(NamedTuple):
+    """One Anna's Archive result page plus what a pager needs to ask for the next one."""
 
-    Args:
-        query: Search term (ISBN, title, author, etc.)
-        filters: Search filters (language, format, content type, etc.)
+    records: list[BrowseRecord]
+    page: int
+    has_more: bool
+    page_rows: int
 
-    Returns:
-        List[BrowseRecord]: List of matching books
 
-    Raises:
-        SearchUnavailableError: If Anna's Archive cannot be reached
-        Exception: If parsing fails
+class _AAPageFetch(NamedTuple):
+    """Raw outcome of a single AA page fetch, before dedup or any paging policy."""
 
+    records: list[BrowseRecord]
+    page_rows: int
+    # "ok" | "unreachable" | "no_files" | "no_table"
+    status: str
+
+
+class _AASearchRequest(NamedTuple):
+    """Everything that stays constant across the pages of one AA query."""
+
+    query_html: str
+    filters_query: str
+    formats: list[str]
+    selector: network.AAMirrorSelector
+
+
+# Longest AA result page observed in this process, measured in rows AA actually
+# rendered. AA's page size is a property of the site, not of a query, so a single-page
+# fetch can reuse what earlier fetches measured -- that is the only way the "a short
+# page is the last page" heuristic survives being called one page at a time.
+#
+# HONEST LIMITS (do not restore the old "can never truncate a result set" claim):
+# this is process-wide, monotonic and never reset, so it is shared across queries and
+# users of a worker. A query whose full page renders fewer countable rows than the
+# longest page this process has seen CAN be cut short at has_more. The value is
+# bounded above by AA's page size (a page cannot exceed it), so the error is always
+# small -- which is exactly what _PAGE_LENGTH_SLACK_RATIO is sized for -- but it is
+# not zero. Get it wrong the other way and the cost is one extra fetch.
+_observed_aa_page_size = 0
+
+
+def _record_observed_page_size(page_rows: int) -> None:
+    """Remember the longest AA page seen so far (see _observed_aa_page_size)."""
+    global _observed_aa_page_size
+    _observed_aa_page_size = max(_observed_aa_page_size, page_rows)
+
+
+def _page_length_slack(reference_rows: int) -> int:
+    """How many rows a page may be missing and still count as a full page."""
+    return max(_PAGE_LENGTH_SLACK, int(reference_rows * _PAGE_LENGTH_SLACK_RATIO))
+
+
+def _page_looks_full(page_rows: int) -> bool:
+    """Whether a page of this length is long enough to expect another one after it.
+
+    Without a measured reference the fallback length is used rather than an
+    unconditional "yes": a fresh worker (gunicorn runs --workers 1, so that is every
+    container restart) would otherwise promise a page 2 for every first search, and
+    the user pays a 45-60s protection-challenge solve to be shown nothing.
     """
+    if page_rows <= 0:
+        return False
+    reference = _observed_aa_page_size or _AA_MIN_PLAUSIBLE_PAGE_SIZE
+    return page_rows + _page_length_slack(reference) >= reference
+
+
+def _prepare_search_request(query: str, filters: SearchFilters) -> _AASearchRequest:
+    """Build the query/filter parts that every page of one AA search shares."""
     query_html = quote(query)
 
     if filters.isbn:
@@ -411,7 +482,168 @@ def search_books(query: str, filters: SearchFilters) -> list[BrowseRecord]:
                 filters_query += f"&termtype_{index}={filter_type}&termval_{index}={quote(value)}"
                 index += 1
 
-    selector = network.AAMirrorSelector()
+    return _AASearchRequest(
+        query_html=query_html,
+        filters_query=filters_query,
+        formats=formats_to_use,
+        selector=network.AAMirrorSelector(),
+    )
+
+
+def _search_page_url(search_request: _AASearchRequest, page: int) -> str:
+    """Build the AA search URL for one page (AA pages are 1-based)."""
+    return (
+        f"{network.get_aa_base_url()}"
+        f"/search?index=&page={page}&display=table"
+        f"&acc=aa_download&acc=external_download"
+        f"&ext={'&ext='.join(search_request.formats)}"
+        f"&q={search_request.query_html}"
+        f"{search_request.filters_query}"
+    )
+
+
+def _fetch_search_page(url: str, selector: network.AAMirrorSelector) -> _AAPageFetch:
+    """Fetch and parse exactly one AA result page. Never raises for an empty result."""
+    # BYPASS-LEITER-FIX 2026-08-31: use_bypasser=True erzwang den Browser-Solve auf
+    # JEDER Seite (~60s, Chrome-Neustart pro Page) und uebersprang damit die Leiter in
+    # http.py: erst Plain-GET mit gecachten Bypass-Cookies, bei 403 Retry mit frischen
+    # Cookies, erst dann Browser. AA sitzt inzwischen hinter DDoS-Guard statt
+    # Cloudflare. allow_bypasser_fallback=True bleibt (Upstream-Default ist zwar True,
+    # aber der urspruengliche Suchpfad setzte hier explizit False).
+    html = downloader.html_get_page(url, selector=selector, allow_bypasser_fallback=True)
+    if not html:
+        return _AAPageFetch([], 0, "unreachable")
+
+    if "No files found." in html:
+        return _AAPageFetch([], 0, "no_files")
+
+    soup = BeautifulSoup(_html_response_text(html), "html.parser")
+    tbody = soup.find("table")
+
+    if tbody is None:
+        return _AAPageFetch([], 0, "no_table")
+    if not isinstance(tbody, Tag):
+        msg = f"Expected results table tag, got {type(tbody).__name__}"
+        raise TypeError(msg)
+
+    records: list[BrowseRecord] = []
+    page_rows = 0
+    for line_tr in tbody.find_all("tr"):
+        # Count what AA SERVED, not what we managed to parse. _parse_search_result_row
+        # legitimately returns None for ad rows and for rows with an empty publisher,
+        # year or language span -- all common on AA. Counting parse successes would
+        # turn a full page into a "short" one and end pagination after page 1.
+        if _is_result_row(line_tr):
+            page_rows += 1
+        book = _parse_search_result_row(line_tr)
+        if not book:
+            continue
+        records.append(book)
+
+    return _AAPageFetch(records, page_rows, "ok")
+
+
+def _sort_by_supported_format(records: list[BrowseRecord]) -> None:
+    """Stable in-place sort putting preferred formats first, keeping AA's ranking."""
+    supported_formats = _get_supported_formats()
+    records.sort(
+        key=lambda x: (
+            supported_formats.index(x.format)
+            if x.format in supported_formats
+            else len(supported_formats)
+        )
+    )
+
+
+def search_books_page(query: str, filters: SearchFilters, *, page: int = 1) -> AASearchPage:
+    """Search for books, fetching exactly ONE result page.
+
+    One call fetches one page, i.e. at most one DDoS-Guard browser solve (40-60s).
+    This is the entry point for on-demand paging, where the user asks for each further
+    page explicitly; search_books() keeps the multi-page loop for the flows that have
+    no UI to page with.
+
+    Args:
+        query: Search term (ISBN, title, author, etc.)
+        filters: Search filters (language, format, content type, etc.)
+        page: 1-based AA result page to fetch.
+
+    Returns:
+        AASearchPage: the page's records plus has_more for the next page.
+
+    Raises:
+        SearchUnavailableError: If Anna's Archive cannot be reached -- on ANY page. A
+            dead mirror must not look like the end of the list.
+        RuntimeError: If page 1 has no results table at all.
+
+    """
+    page = max(1, page)
+    search_request = _prepare_search_request(query, filters)
+    fetch = _fetch_search_page(_search_page_url(search_request, page), search_request.selector)
+
+    if fetch.status == "unreachable":
+        msg = "Unable to reach download source. Network restricted or mirrors are blocked."
+        raise SearchUnavailableError(msg)
+
+    if fetch.status == "no_files":
+        logger.info("No books found for query: %s (page %d)", query, page)
+        return AASearchPage([], page, has_more=False, page_rows=0)
+
+    if fetch.status == "no_table":
+        # Page 1 without a table is a broken response; a later page without one is
+        # simply the end of the list and must stay a normal, empty 200.
+        if page == 1:
+            logger.warning("No results table found for query: %s", query)
+            msg = "No books found. Please try another query."
+            raise RuntimeError(msg)
+        logger.info("No results table on page %d, treating it as the end of the list", page)
+        return AASearchPage([], page, has_more=False, page_rows=0)
+
+    seen_ids: set[str] = set()
+    records: list[BrowseRecord] = []
+    for record in fetch.records:
+        if record.id in seen_ids:
+            continue
+        seen_ids.add(record.id)
+        records.append(record)
+
+    # Ask before recording, otherwise the current page always matches itself.
+    # Measured in rows AA SERVED, not in parsed records: a page whose rows all fail
+    # the content checks (ads, missing spans) is still a full page with more behind it,
+    # and `bool(records)` would end the list there without a word.
+    has_more = _page_looks_full(fetch.page_rows)
+    _record_observed_page_size(fetch.page_rows)
+    _sort_by_supported_format(records)
+
+    logger.info(
+        "search_books_page: %d unique books on page %d for '%s' (has_more=%s)",
+        len(records),
+        page,
+        query,
+        has_more,
+    )
+    return AASearchPage(records, page, has_more, fetch.page_rows)
+
+
+def search_books(query: str, filters: SearchFilters) -> list[BrowseRecord]:
+    """Search for books matching the query, fetching up to AA_MAX_PAGES pages.
+
+    Used by the flows without a pager UI (ISBN / title+author release search). The
+    browse path fetches one page per request via search_books_page() instead.
+
+    Args:
+        query: Search term (ISBN, title, author, etc.)
+        filters: Search filters (language, format, content type, etc.)
+
+    Returns:
+        List[BrowseRecord]: List of matching books
+
+    Raises:
+        SearchUnavailableError: If Anna's Archive cannot be reached
+        Exception: If parsing fails
+
+    """
+    search_request = _prepare_search_request(query, filters)
 
     # PAGINATION-PATCH 2026-05-04: hole bis zu AA_MAX_PAGES Pages, dedupe per ID.
     # Eine Page, die deutlich kuerzer ist als die laengste bisher gesehene, ist die
@@ -451,23 +683,9 @@ def search_books(query: str, filters: SearchFilters) -> list[BrowseRecord]:
             break
 
         last_page_reached = page
-        url = (
-            f"{network.get_aa_base_url()}"
-            f"/search?index=&page={page}&display=table"
-            f"&acc=aa_download&acc=external_download"
-            f"&ext={'&ext='.join(formats_to_use)}"
-            f"&q={query_html}"
-            f"{filters_query}"
-        )
+        fetch = _fetch_search_page(_search_page_url(search_request, page), search_request.selector)
 
-        # BYPASS-LEITER-FIX 2026-08-31: use_bypasser=True erzwang den Browser-Solve auf
-        # JEDER Seite (~60s, Chrome-Neustart pro Page) und uebersprang damit die Leiter in
-        # http.py: erst Plain-GET mit gecachten Bypass-Cookies, bei 403 Retry mit frischen
-        # Cookies, erst dann Browser. AA sitzt inzwischen hinter DDoS-Guard statt
-        # Cloudflare. allow_bypasser_fallback=True bleibt (Upstream-Default ist zwar True,
-        # aber der urspruengliche Suchpfad setzte hier explizit False).
-        html = downloader.html_get_page(url, selector=selector, allow_bypasser_fallback=True)
-        if not html:
+        if fetch.status == "unreachable":
             if page == 1:
                 # Network/mirror exhaustion path bubbles up so API can notify clients
                 msg = "Unable to reach download source. Network restricted or mirrors are blocked."
@@ -477,37 +695,21 @@ def search_books(query: str, filters: SearchFilters) -> list[BrowseRecord]:
             )
             break
 
-        if "No files found." in html:
+        if fetch.status == "no_files":
             if page == 1:
                 logger.info("No books found for query: %s", query)
                 return []
             break
 
-        soup = BeautifulSoup(_html_response_text(html), "html.parser")
-        tbody = soup.find("table")
-
-        if tbody is None:
+        if fetch.status == "no_table":
             if page == 1:
                 logger.warning("No results table found for query: %s", query)
                 msg = "No books found. Please try another query."
                 raise RuntimeError(msg)
             break
-        if not isinstance(tbody, Tag):
-            msg = f"Expected results table tag, got {type(tbody).__name__}"
-            raise TypeError(msg)
 
-        page_rows = 0
         page_unique_count = 0
-        for line_tr in tbody.find_all("tr"):
-            # Count what AA SERVED, not what we managed to parse. _parse_search_result_row
-            # legitimately returns None for ad rows and for rows with an empty publisher,
-            # year or language span -- all common on AA. Counting parse successes would
-            # turn a full page into a "short" one and end pagination after page 1.
-            if _is_result_row(line_tr):
-                page_rows += 1
-            book = _parse_search_result_row(line_tr)
-            if not book:
-                continue
+        for book in fetch.records:
             if book.id in seen_ids:
                 continue
             seen_ids.add(book.id)
@@ -521,25 +723,18 @@ def search_books(query: str, filters: SearchFilters) -> list[BrowseRecord]:
         # search short.
         if page_unique_count == 0:
             break
-        if page_rows + _PAGE_LENGTH_SLACK < max_page_rows:
+        if fetch.page_rows + _page_length_slack(max_page_rows) < max_page_rows:
             logger.debug(
                 "Page %d returned %d of %d rows, treating it as the last page",
                 page,
-                page_rows,
+                fetch.page_rows,
                 max_page_rows,
             )
             break
-        max_page_rows = max(max_page_rows, page_rows)
+        max_page_rows = max(max_page_rows, fetch.page_rows)
+        _record_observed_page_size(fetch.page_rows)
 
-    supported_formats = _get_supported_formats()
-
-    all_books.sort(
-        key=lambda x: (
-            supported_formats.index(x.format)
-            if x.format in supported_formats
-            else len(supported_formats)
-        )
-    )
+    _sort_by_supported_format(all_books)
 
     logger.info(
         "search_books pagination: %d unique books across %d page(s) for '%s'",
@@ -1583,11 +1778,26 @@ class DirectDownloadSource(ReleaseSource):
         # Tracks which search method was used in the last search() call
         # "isbn" = ISBN search returned results, "title_author" = title+author was used
         self._last_search_type: str = "title_author"
+        # Paging state of the last browse search, reported to the API so the client
+        # can offer "load more". get_source() builds a fresh instance per request, so
+        # this never leaks between requests.
+        self._last_search_page: int = 1
+        self._last_search_has_more: bool = False
 
     @property
     def last_search_type(self) -> str:
         """Returns the search type used in the last search() call."""
         return self._last_search_type
+
+    @property
+    def last_search_page(self) -> int:
+        """Returns the result page fetched in the last search() call."""
+        return self._last_search_page
+
+    @property
+    def last_search_has_more(self) -> bool:
+        """Whether another result page can be requested after the last search() call."""
+        return self._last_search_has_more
 
     def get_column_config(self) -> ReleaseColumnConfig:
         """Column configuration for Direct Download source.
@@ -1650,24 +1860,29 @@ class DirectDownloadSource(ReleaseSource):
             return None
         return get_aa_content_type_dir(task.content_type)
 
-    def _search_books_with_language_fallback(
+    def _search_page_with_language_fallback(
         self,
         query: str,
         filters: SearchFilters,
         *,
-        search_label: str,
-    ) -> list[BrowseRecord]:
-        """Retry AA queries without a language filter when filtered search returns nothing."""
-        results = search_books(query, filters)
-        if results or not filters.lang:
-            return results
+        page: int,
+    ) -> tuple[AASearchPage, bool]:
+        """Fetch one browse page, retrying page 1 without the language filter if empty.
+
+        The retry is restricted to page 1 on purpose: on a later page it would cost a
+        second DDoS-Guard solve AND continue a different query than the pages already
+        shown. Returns the page plus whether the fallback produced the records.
+        """
+        result = search_books_page(query, filters, page=page)
+        if result.records or page > 1 or not filters.lang:
+            return result, False
 
         logger.debug(
-            "No %s results with langs=%s, retrying without language filter",
-            search_label,
+            "No manual results with langs=%s, retrying without language filter",
             filters.lang,
         )
-        return search_books(query, replace(filters, lang=None))
+        fallback = search_books_page(query, replace(filters, lang=None), page=page)
+        return fallback, bool(fallback.records)
 
     def search(
         self,
@@ -1695,6 +1910,8 @@ class DirectDownloadSource(ReleaseSource):
 
         # Reset search type tracking
         self._last_search_type = "title_author"
+        self._last_search_page = 1
+        self._last_search_has_more = False
 
         if plan.source_filters is not None:
             query = plan.manual_query or ""
@@ -1703,11 +1920,36 @@ class DirectDownloadSource(ReleaseSource):
             )
             filters = plan.source_filters or SearchFilters()
             filters.lang = lang_filter if lang_filter is not None else (filters.lang or [])
-            results = self._search_books_with_language_fallback(
-                query, filters, search_label="manual"
+            # The browse path fetches exactly ONE page per request: every page costs a
+            # DDoS-Guard browser solve, so further pages are only fetched when the user
+            # asks for them.
+            #
+            # Deliberately NOT AA_MAX_PAGES. That key is the loop bound of the pagerless
+            # release search (search_books below), where every extra page is spent
+            # unasked and where production keeps it at 1 to stay fast. Reusing it here
+            # would make the two settings fight: AA_MAX_PAGES=1 clamps page to 1, so
+            # `page < max_pages` is 1 < 1 and has_more can never be true -- the Load
+            # More button would never appear. AA_BROWSE_MAX_PAGES is only a guard rail
+            # against a client jumping to page 400; each page here is still one request.
+            browse_max_page = _int_setting(
+                "AA_BROWSE_MAX_PAGES", _AA_BROWSE_MAX_PAGES_DEFAULT, minimum=1
+            )
+            # getattr, not plan.page: this module is ALSO deployed as a runtime
+            # bind-mount patch over an older image whose ReleaseSearchPlan has no page
+            # field yet. There the browse path simply stays on page 1.
+            requested_page: int = getattr(plan, "page", 1) or 1
+            page = min(max(1, requested_page), browse_max_page)
+            result, used_language_fallback = self._search_page_with_language_fallback(
+                query, filters, page=page
+            )
+            self._last_search_page = page
+            # A fallback page 1 answers a different query (no language filter) than the
+            # one the client would page on, so it does not offer a page 2.
+            self._last_search_has_more = (
+                result.has_more and page < browse_max_page and not used_language_fallback
             )
             self._last_search_type = "manual" if query else "title_author"
-            return [_browse_record_to_release(record) for record in results]
+            return [_browse_record_to_release(record) for record in result.records]
 
         # ISBN search first (unless expand_search requested)
         if plan.manual_query:

@@ -257,3 +257,84 @@ def test_release_source_record_endpoint_returns_503_when_source_unavailable(main
     assert resp.get_json() == {
         "error": "Unable to reach download source. Network restricted or mirrors are blocked."
     }
+
+
+def test_direct_source_query_passes_page_and_reports_paging(main_module, client):
+    """Browse mode paging: ?page=N reaches the source, page/has_more come back."""
+    captured = {}
+
+    class _PagingDirectSource:
+        last_search_type = "query"
+        last_search_page = 2
+        last_search_has_more = True
+
+        def search(self, book, plan, expand_search=False, content_type="ebook"):
+            captured["page"] = plan.page
+            return [
+                Release(
+                    source="direct_download",
+                    source_id="md5-page-2",
+                    title="Pride and Prejudice",
+                    format="epub",
+                    size="1 MB",
+                )
+            ]
+
+        def get_column_config(self):
+            return ReleaseColumnConfig(
+                columns=[
+                    ColumnSchema(
+                        key="format",
+                        label="Format",
+                        render_type=ColumnRenderType.BADGE,
+                        align=ColumnAlign.CENTER,
+                        width="80px",
+                    ),
+                ],
+                grid_template="minmax(0,2fr) 80px",
+            )
+
+    with patch.object(main_module, "get_auth_mode", return_value="none"):
+        with patch("shelfmark.release_sources.get_source", return_value=_PagingDirectSource()):
+            resp = client.get(
+                "/api/releases",
+                query_string={
+                    "source": "direct_download",
+                    "query": "Pride and Prejudice",
+                    "page": "2",
+                },
+            )
+
+    assert resp.status_code == 200
+    assert captured["page"] == 2
+    body = resp.get_json()
+    assert body["page"] == 2
+    assert body["has_more"] is True
+    assert body["releases"][0]["source_id"] == "md5-page-2"
+
+
+def test_direct_source_query_defaults_to_page_one(main_module, client):
+    """No page parameter, a garbage one and a zero all mean page 1."""
+    captured = []
+
+    class _PageOneSource(_FakeDirectSource):
+        def search(self, book, plan, expand_search=False, content_type="ebook"):
+            captured.append(plan.page)
+            return []
+
+    for query_string in (
+        {"source": "direct_download", "query": "dune"},
+        {"source": "direct_download", "query": "dune", "page": "not-a-number"},
+        {"source": "direct_download", "query": "dune", "page": "0"},
+    ):
+        with patch.object(main_module, "get_auth_mode", return_value="none"):
+            with patch("shelfmark.release_sources.get_source", return_value=_PageOneSource()):
+                resp = client.get("/api/releases", query_string=query_string)
+
+        assert resp.status_code == 200
+        body = resp.get_json()
+        assert body["page"] == 1
+        # A source without paging state must not claim there is more.
+        assert body["has_more"] is False
+
+    assert captured == [1, 1, 1]

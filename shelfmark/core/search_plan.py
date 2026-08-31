@@ -45,6 +45,9 @@ class ReleaseSearchPlan:
     manual_query: str | None = None
     indexers: list[str] | None = None  # Indexer names for Prowlarr (overrides settings)
     source_filters: SearchFilters | None = None
+    # 1-based result page for source-native browse searches. Sources without a paging
+    # concept ignore it; Direct Download fetches exactly this page.
+    page: int = 1
 
     @property
     def primary_query(self) -> str:
@@ -102,6 +105,7 @@ def build_release_search_plan(
     manual_query: str | None = None,
     indexers: list[str] | None = None,
     source_filters: SearchFilters | None = None,
+    page: int = 1,
 ) -> ReleaseSearchPlan:
     """Build normalized search variants shared across release sources."""
     resolved_languages = _normalize_languages(languages)
@@ -125,6 +129,7 @@ def build_release_search_plan(
             manual_query=resolved_manual_query,
             indexers=indexers,
             source_filters=source_filters,
+            page=page,
         )
 
     isbn_candidates: list[str] = []
@@ -181,4 +186,5 @@ def build_release_search_plan(
         manual_query=None,
         indexers=indexers,
         source_filters=source_filters,
+        page=page,
     )

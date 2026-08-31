@@ -28,6 +28,7 @@ import {
   transformSourceRecordToBook,
 } from '../utils/bookTransformers';
 import { isRecord, toStringValue } from '../utils/objectHelpers';
+import { buildDirectSearchQuery } from './directSearchHelpers';
 import type { FulfilAdminRequestBody, RejectAdminRequestBody } from './requestApiHelpers';
 import {
   buildAdminRequestActionUrl,
@@ -236,17 +237,28 @@ async function fetchJSON<T>(
 }
 
 // API functions
-export const searchBooks = async (query: string): Promise<Book[]> => {
-  if (!query) return [];
+export interface DirectSearchResult {
+  books: Book[];
+  hasMore: boolean;
+  page: number;
+}
+
+export const searchBooks = async (query: string, page = 1): Promise<DirectSearchResult> => {
+  if (!query) return { books: [], hasMore: false, page: 1 };
   // Same endpoint as getReleases(): Anna's Archive full-text search can require
   // a DDoS-Guard browser solve per page, which never fits the 30s default.
   // Let the backend control timeouts here as well.
   const response = await fetchJSON<ReleasesResponse>(
-    `${API_BASE}/releases?source=direct_download&${query}`,
+    `${API_BASE}/releases?source=direct_download&${buildDirectSearchQuery(query, page)}`,
     {},
     null,
   );
-  return response.releases.map(transformReleaseToDirectBook);
+  return {
+    books: response.releases.map(transformReleaseToDirectBook),
+    // An older backend without the paging contract simply reports no further pages.
+    hasMore: response.has_more ?? false,
+    page: response.page ?? page,
+  };
 };
 
 // Metadata search response type (internal)

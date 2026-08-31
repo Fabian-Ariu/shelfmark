@@ -62,6 +62,11 @@ export const ResultsSection = ({
     searchMode === 'universal'
       ? 'bg-emerald-600 text-white hover:bg-emerald-700'
       : 'bg-sky-700 text-white hover:bg-sky-800';
+  // Direct mode loads one Anna's Archive page per click and each one waits on a
+  // protection challenge, so the button says what it costs instead of "Load More".
+  const loadMoreLabel = searchMode === 'universal' ? 'Load More' : 'Load Next Page';
+  const loadMoreBusyLabel =
+    searchMode === 'universal' ? 'Loading...' : 'Loading next page (~45s)...';
   const [viewMode, setViewMode] = useState<'card' | 'compact' | 'list'>(() => {
     if (typeof window === 'undefined') {
       return 'compact';
@@ -254,8 +259,8 @@ export const ResultsSection = ({
       )}
       {books.length === 0 && <div className="mt-4 text-sm opacity-80">No results found.</div>}
 
-      {/* Load More button (universal mode pagination) */}
-      {searchMode === 'universal' && hasMore && onLoadMore && (
+      {/* Load More button: universal metadata pages / direct AA result pages */}
+      {hasMore && onLoadMore && (
         <div className="mt-12 flex flex-col items-center gap-2">
           <button
             type="button"
@@ -264,7 +269,7 @@ export const ResultsSection = ({
             className={`rounded-full px-3 py-2 text-sm font-medium transition-all duration-200 ${
               isLoadingMore
                 ? 'cursor-wait bg-gray-300 text-gray-500 dark:bg-gray-600 dark:text-gray-400'
-                : 'bg-emerald-600 text-white hover:bg-emerald-700'
+                : activeViewClasses
             }`}
           >
             {isLoadingMore ? (
@@ -285,15 +290,24 @@ export const ResultsSection = ({
                     d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"
                   />
                 </svg>
-                Loading...
+                {loadMoreBusyLabel}
               </span>
             ) : (
-              'Load More'
+              loadMoreLabel
             )}
           </button>
-          {totalFound !== undefined && totalFound > 0 && (
+          {/* Direct mode: Anna's Archive reports no total, and every further page costs
+              a protection-challenge solve of roughly a minute -- say so up front. */}
+          {searchMode === 'universal' ? (
+            totalFound !== undefined &&
+            totalFound > 0 && (
+              <span className="text-sm text-gray-500 dark:text-gray-400">
+                Showing {books.length} of {totalFound} results
+              </span>
+            )
+          ) : (
             <span className="text-sm text-gray-500 dark:text-gray-400">
-              Showing {books.length} of {totalFound} results
+              Showing {books.length} results &middot; each page takes ~45s
             </span>
           )}
         </div>

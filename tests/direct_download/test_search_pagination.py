@@ -256,3 +256,175 @@ class TestIsResultRow:
 
         soup = BeautifulSoup(f"<table>{_HEADER_ROW}{_AD_ROW}</table>", "html.parser")
         assert [dd._is_result_row(tr) for tr in soup.find_all("tr")] == [False, False]
+
+
+class TestSearchBooksPage:
+    """search_books_page(): exactly one AA page per call, plus has_more for the pager."""
+
+    @pytest.fixture(autouse=True)
+    def _reset_observed_page_size(self, monkeypatch):
+        """Isolate the process-wide page-size reference the has_more heuristic uses."""
+        import shelfmark.release_sources.direct_download as dd
+
+        monkeypatch.setattr(dd, "_observed_aa_page_size", 0)
+
+    def test_one_call_fetches_exactly_one_page(self, monkeypatch):
+        """The whole point: one request, one page, one DDoS-Guard solve."""
+        monkeypatch.setenv("AA_MAX_PAGES", "5")
+        dd, requested = _install_stubs(monkeypatch, [_page_html(PAGE_SIZE) for _ in range(5)])
+
+        result = dd.search_books_page("query", SearchFilters(), page=1)
+
+        assert len(requested) == 1
+        assert "page=1" in requested[0]
+        assert len(result.records) == PAGE_SIZE
+        assert result.page == 1
+
+    def test_requested_page_is_the_page_fetched(self, monkeypatch):
+        dd, requested = _install_stubs(monkeypatch, [_page_html(PAGE_SIZE)])
+
+        result = dd.search_books_page("query", SearchFilters(), page=3)
+
+        assert len(requested) == 1
+        assert "page=3" in requested[0]
+        assert result.page == 3
+
+    def test_full_page_reports_more(self, monkeypatch):
+        dd, _requested = _install_stubs(monkeypatch, [_page_html(PAGE_SIZE)])
+
+        assert dd.search_books_page("query", SearchFilters(), page=1).has_more is True
+
+    def test_short_last_page_reports_no_more(self, monkeypatch):
+        """Page 2 is visibly shorter than page 1, so there is nothing left to fetch."""
+        dd, requested = _install_stubs(monkeypatch, [_page_html(PAGE_SIZE), _page_html(12)])
+
+        first = dd.search_books_page("query", SearchFilters(), page=1)
+        last = dd.search_books_page("query", SearchFilters(), page=2)
+
+        assert len(requested) == 2
+        assert first.has_more is True
+        assert last.has_more is False
+        assert len(last.records) == 12
+
+    def test_unparsable_row_does_not_end_the_list(self, monkeypatch):
+        """A row the parser drops must not make a full page look like the last one.
+
+        Counting parse successes instead of served rows would report 99 of 100 rows,
+        set has_more=False and hide every further page behind a dead button.
+        """
+        dd, _requested = _install_stubs(
+            monkeypatch,
+            [_page_html(PAGE_SIZE), _page_html(PAGE_SIZE, unparsable=1)],
+        )
+
+        dd.search_books_page("query", SearchFilters(), page=1)
+        second = dd.search_books_page("query", SearchFilters(), page=2)
+
+        assert len(second.records) == PAGE_SIZE - 1
+        assert second.page_rows == PAGE_SIZE
+        assert second.has_more is True
+
+    def test_ad_row_does_not_end_the_list(self, monkeypatch):
+        dd, _requested = _install_stubs(
+            monkeypatch,
+            [_page_html(PAGE_SIZE), _page_html(PAGE_SIZE, extra_rows=_AD_ROW)],
+        )
+
+        dd.search_books_page("query", SearchFilters(), page=1)
+        second = dd.search_books_page("query", SearchFilters(), page=2)
+
+        assert second.has_more is True
+
+    def test_empty_result_page_reports_no_more(self, monkeypatch):
+        dd, _requested = _install_stubs(monkeypatch, ["<html>No files found.</html>"])
+
+        result = dd.search_books_page("query", SearchFilters(), page=2)
+
+        assert result.records == []
+        assert result.has_more is False
+
+    def test_missing_table_on_a_later_page_is_the_end_not_an_error(self, monkeypatch):
+        """Page 1 without a table is broken; a later one is simply the end of the list."""
+        dd, _requested = _install_stubs(monkeypatch, ["<html><p>nothing here</p></html>"])
+
+        result = dd.search_books_page("query", SearchFilters(), page=4)
+
+        assert result.records == []
+        assert result.has_more is False
+
+    def test_missing_table_on_page_one_still_raises(self, monkeypatch):
+        dd, _requested = _install_stubs(monkeypatch, ["<html><p>nothing here</p></html>"])
+
+        with pytest.raises(RuntimeError):
+            dd.search_books_page("query", SearchFilters(), page=1)
+
+    def test_unreachable_later_page_raises_instead_of_ending_the_list(self, monkeypatch):
+        """A dead mirror on page 3 must surface as an error, not as "no more results"."""
+        dd, _requested = _install_stubs(monkeypatch, [""])
+
+        with pytest.raises(SearchUnavailableError):
+            dd.search_books_page("query", SearchFilters(), page=3)
+
+    def test_duplicates_within_a_page_are_dropped(self, monkeypatch):
+        duplicate = _result_row("md5-duplicate")
+        html = f"<table>{_HEADER_ROW}{duplicate}{duplicate}</table>"
+        dd, _requested = _install_stubs(monkeypatch, [html])
+
+        result = dd.search_books_page("query", SearchFilters(), page=1)
+
+        assert len(result.records) == 1
+        assert result.page_rows == 2
+
+    def test_cold_start_short_page_reports_no_more(self, monkeypatch):
+        """The FIRST search of a fresh worker must not promise a page that is not there.
+
+        gunicorn runs --workers 1, so "no page length measured yet" is the state after
+        every container restart. Answering has_more=True there bought the user a
+        45-60s protection-challenge solve for a guaranteed empty page 2.
+        """
+        dd, _requested = _install_stubs(monkeypatch, [_page_html(34)])
+
+        result = dd.search_books_page("der marsianer", SearchFilters(), page=1)
+
+        assert len(result.records) == 34
+        assert result.has_more is False
+
+    def test_cold_start_full_page_reports_more(self, monkeypatch):
+        """The fallback reference must stay below every page length AA actually serves."""
+        dd, _requested = _install_stubs(monkeypatch, [_page_html(PAGE_SIZE)])
+
+        assert dd.search_books_page("query", SearchFilters(), page=1).has_more is True
+
+    def test_ad_rows_do_not_end_the_list_on_page_one(self, monkeypatch):
+        """A full page carrying ad rows must not look short next to an earlier query.
+
+        The page-length reference is process-wide, so query B is measured against
+        query A's longest page. With a fixed slack of 2 rows, three ad rows were enough
+        to report has_more=False on PAGE ONE of a full result set -- no button, no log,
+        no way for the user to learn that more exists.
+        """
+        import shelfmark.release_sources.direct_download as dd_module
+
+        monkeypatch.setattr(dd_module, "_observed_aa_page_size", PAGE_SIZE)
+        dd, _requested = _install_stubs(
+            monkeypatch, [_page_html(PAGE_SIZE - 3, extra_rows=_AD_ROW * 3)]
+        )
+
+        result = dd.search_books_page("query b", SearchFilters(), page=1)
+
+        assert result.page_rows == PAGE_SIZE - 3
+        assert result.has_more is True
+
+    def test_page_of_unparsable_rows_does_not_end_the_list(self, monkeypatch):
+        """has_more counts rows AA served, not records we managed to parse.
+
+        A page whose rows all fail the content checks still is a full page with more
+        behind it; deriving has_more from the parsed records ended the list silently.
+        """
+        dd, _requested = _install_stubs(monkeypatch, [_page_html(PAGE_SIZE, unparsable=PAGE_SIZE)])
+
+        result = dd.search_books_page("query", SearchFilters(), page=1)
+
+        assert result.records == []
+        assert result.page_rows == PAGE_SIZE
+        assert result.has_more is True
