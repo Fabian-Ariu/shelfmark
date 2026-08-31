@@ -126,6 +126,16 @@ def get_cf_user_agent_for_domain(domain: str) -> str | None:
     return _get_internal_bypasser().get_cf_user_agent_for_domain(domain)
 
 
+def refresh_cf_cookies_for_domain(url: str, cookies: list[object]) -> None:
+    """Write rotated protection cookies back to the store - internal bypasser only."""
+    if not cookies or not _is_cf_bypass_enabled() or _is_using_external_bypasser():
+        return
+    try:
+        _get_internal_bypasser().refresh_cookies_for_domain(url, cookies)
+    except _BYPASSER_ERRORS as e:
+        logger.debug("Could not refresh protection cookies for %s: %s", url, e)
+
+
 def _apply_cf_bypass(url: str, headers: dict) -> dict:
     """Apply CF bypass cookies and user agent if available.
 
@@ -200,6 +210,29 @@ def _is_retryable_error(e: Exception) -> bool:
     return status is not None and status in RETRYABLE_CODES
 
 
+def _response_cookie_objects(response: object) -> dict[str, object]:
+    """Extract Set-Cookie entries from a response as a name->cookie mapping.
+
+    DDoS-Guard (Anna's Archive) rotates `__ddg8_`/`__ddg10_` on *every* response --
+    including the 302 to `&check=1` -- and expects the fresh values on the next hop.
+    The cookie objects (not just their values) are kept so the refreshed expiry can be
+    written back to the bypass store. Returns an empty mapping for responses without a
+    cookie jar.
+    """
+    jar = getattr(response, "cookies", None)
+    if not jar:
+        return {}
+    try:
+        return {cookie.name: cookie for cookie in jar if getattr(cookie, "value", None) is not None}
+    except TypeError:
+        return {}
+
+
+def _response_cookies(response: object) -> dict[str, str]:
+    """Extract Set-Cookie values from a response as a plain name->value mapping."""
+    return {name: cookie.value for name, cookie in _response_cookie_objects(response).items()}
+
+
 def _try_rotation(
     original_url: str, current_url: str, selector: network.AAMirrorSelector
 ) -> str | None:
@@ -268,6 +301,12 @@ def html_get_page(
             logger.info("html_get_page cancelled before attempt %s", attempt)
             return _result("", current_url)
 
+        # Start every attempt from the canonical URL on the currently selected
+        # mirror. A previous attempt may have left current_url pointing at a
+        # protection challenge redirect (AA's "...&check=1"), which is not a URL
+        # we ever want to retry directly.
+        current_url = selector.rewrite(original_url)
+
         cookies: dict[str, str] = {}
         try:
             if use_bypasser_now and _is_cf_bypass_enabled():
@@ -314,19 +353,31 @@ def html_get_page(
             allow_redirects = not is_aa_url
 
             redirects_followed = 0
+            # Try with CF cookies/UA if available (from previous bypass). Seeded
+            # once per host: `hop_cookies` then carries the per-response cookies
+            # DDoS-Guard rotates along the manual redirect chain. Replaying the
+            # stale snapshot on every hop made DDoS-Guard answer 302 forever until
+            # _MAX_REDIRECTS tripped (TooManyRedirects), which burned attempts and
+            # eventually rotated the mirror -- discarding the just-solved cookies.
+            cookies = _apply_cf_bypass(current_url, headers)
+            hop_cookies = dict(cookies)
+            # Cookies the server itself set on this hop chain, kept as cookie objects
+            # so their refreshed expiry can go back into the bypass store on success.
+            fresh_cookies: dict[str, object] = {}
             while True:
-                # Try with CF cookies/UA if available (from previous bypass)
-                cookies = _apply_cf_bypass(current_url, headers)
                 request_client = session or requests
                 response = request_client.get(
                     current_url,
                     proxies=get_proxies(current_url),
                     timeout=REQUEST_TIMEOUT,
-                    cookies=cookies,
+                    cookies=hop_cookies,
                     headers=headers,
                     allow_redirects=allow_redirects,
                     verify=get_ssl_verify(current_url),
                 )
+                response_cookies = _response_cookie_objects(response)
+                fresh_cookies.update(response_cookies)
+                hop_cookies.update({name: c.value for name, c in response_cookies.items()})
 
                 if is_aa_url and response.is_redirect:
                     location = response.headers.get("Location", "")
@@ -354,8 +405,13 @@ def html_get_page(
                         new_url = _try_rotation(original_url, current_url, selector)
                         if new_url:
                             current_url = new_url
-                            # Reset per-request state for the new host.
+                            # Reset per-request state for the new host. Protection
+                            # cookies are per domain, so the old jar is worthless
+                            # here and must not leak to the new mirror.
                             headers = {"User-Agent": DOWNLOAD_HEADERS["User-Agent"]}
+                            cookies = _apply_cf_bypass(current_url, headers)
+                            hop_cookies = dict(cookies)
+                            fresh_cookies = {}
                             is_aa_url = network.should_rotate_dns_for_url(current_url)
                             allow_redirects = not is_aa_url
                             redirects_followed = 0
@@ -377,6 +433,14 @@ def html_get_page(
                     continue
 
                 response.raise_for_status()
+                # The store is only ever refreshed by a browser solve otherwise, so a
+                # long run of successful requests would let it expire underneath us and
+                # force a solve seconds after a working cookie set was in hand.
+                if fresh_cookies:
+                    refresh_cf_cookies_for_domain(
+                        getattr(response, "url", None) or current_url,
+                        list(fresh_cookies.values()),
+                    )
                 if success_delay > 0:
                     time.sleep(success_delay)
                 return _result(response.text, response.url)

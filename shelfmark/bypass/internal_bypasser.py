@@ -245,6 +245,14 @@ DDG_COOKIE_NAMES = {
 }
 
 
+# Cookies that actually gate access. If one of these has a stored expiry in the
+# past, the whole domain entry is worthless and must be re-solved. Cloudflare uses
+# cf_clearance; DDoS-Guard (Anna's Archive since 2026-08) uses __ddg8_/__ddg10_,
+# which expire after ~20 minutes -- without this check the store would hand out
+# dead cookies forever, because the old check only looked at cf_clearance.
+EXPIRY_CRITICAL_COOKIE_NAMES = ("cf_clearance", "__ddg2_", "__ddg8_", "__ddg10_")
+
+
 def _get_base_domain(domain: str) -> str:
     """Extract base domain from hostname (e.g., 'www.example.com' -> 'example.com')."""
     return ".".join(domain.split(".")[-2:]) if "." in domain else domain
@@ -313,6 +321,69 @@ def _store_extracted_cookies(
     logger.debug("Extracted %s %s cookies for %s", len(cookies_found), cookie_type, base_domain)
 
 
+def refresh_cookies_for_domain(url: str, cookies: list[Any]) -> None:
+    """Refresh stored protection cookies from a successful non-browser request.
+
+    DDoS-Guard rotates ``__ddg8_``/``__ddg10_`` on every response and expires them
+    after roughly 20 minutes. Without a write-back the store stays only as fresh as
+    the last browser solve, so get_cf_cookies_for_domain() eventually discards a
+    cookie set that plain traffic had just renewed -- and pays another 20-67s solve
+    for it.
+
+    Deliberately narrow:
+    - only refreshes domains that already have a solved entry, so ordinary traffic
+      can never create bypass state for a domain we never solved,
+    - only protection cookies, never the full-session extraction used for the
+      Z-Library mirrors: that snapshot must stay the one the browser produced,
+    - keeps the stored expiry when a refreshed cookie carries none.
+    """
+    domain = urlparse(url).hostname or ""
+    if not domain:
+        return
+
+    base_domain = _get_base_domain(domain)
+
+    with _cf_cookies_lock:
+        stored = _cf_cookies.get(base_domain)
+        if not stored:
+            return
+
+        refreshed: list[str] = []
+        for cookie in cookies:
+            name = getattr(cookie, "name", "") or ""
+            if not _should_extract_cookie(name, extract_all=False):
+                continue
+            value = getattr(cookie, "value", None)
+            if value is None:
+                continue
+
+            expires = getattr(cookie, "expires", None)
+            if expires is not None and expires <= 0:
+                expires = None
+
+            entry = dict(stored.get(name, {}))
+            entry["value"] = value
+            entry.setdefault("domain", getattr(cookie, "domain", None) or domain)
+            entry.setdefault("path", getattr(cookie, "path", None) or "/")
+            entry.setdefault("secure", bool(getattr(cookie, "secure", True)))
+            entry.setdefault("httpOnly", True)
+            if expires is not None:
+                entry["expiry"] = expires
+                entry.pop("expires", None)
+
+            stored[name] = entry
+            refreshed.append(name)
+
+        if refreshed:
+            _cf_cookies[base_domain] = stored
+            logger.debug(
+                "Refreshed %d protection cookie(s) for %s: %s",
+                len(refreshed),
+                base_domain,
+                ", ".join(sorted(refreshed)),
+            )
+
+
 async def _extract_cookies_from_cdp(driver: Any, page: Any, url: str) -> None:
     """Extract cookies from a CDP browser after successful bypass."""
     try:
@@ -345,13 +416,16 @@ def get_cf_cookies_for_domain(domain: str) -> dict[str, str]:
         if not cookies:
             return {}
 
-        cf_clearance = cookies.get("cf_clearance", {})
-        if cf_clearance:
-            expiry = cf_clearance.get("expiry")
+        now = time.time()
+        for name in EXPIRY_CRITICAL_COOKIE_NAMES:
+            cookie = cookies.get(name)
+            if not cookie:
+                continue
+            expiry = cookie.get("expiry")
             if expiry is None:
-                expiry = cf_clearance.get("expires")
-            if expiry and expiry > 0 and time.time() > expiry:
-                logger.debug("CF cookies expired for %s", base_domain)
+                expiry = cookie.get("expires")
+            if expiry and expiry > 0 and now > expiry:
+                logger.debug("Protection cookie %s expired for %s", name, base_domain)
                 _cf_cookies.pop(base_domain, None)
                 return {}
 

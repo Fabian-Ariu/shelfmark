@@ -4,6 +4,7 @@ import { useSearchMode } from '../contexts/SearchModeContext';
 import { SORT_OPTIONS } from '../data/filterOptions';
 import { useMediaQuery } from '../hooks/useMediaQuery';
 import type { Book, ButtonStateInfo, SortOption } from '../types';
+import { shouldUseReleaseFlow } from '../utils/shouldUseReleaseFlow';
 import { Dropdown } from './Dropdown';
 import { CardView } from './resultsViews/CardView';
 import { CompactView } from './resultsViews/CompactView';
@@ -217,11 +218,10 @@ export const ResultsSection = ({
           {books.map((book, index) => {
             const shouldUseCardLayout = isDesktop && viewMode === 'card';
             const animationDelay = index * 50;
-            // Use appropriate button state function based on search mode
-            const buttonState =
-              searchMode === 'universal'
-                ? getUniversalButtonState(book.id)
-                : getButtonState(book.id);
+            // Button state must follow the same predicate as BookActionButton
+            const buttonState = shouldUseReleaseFlow(searchMode, book)
+              ? getUniversalButtonState(book.id)
+              : getButtonState(book.id);
 
             return shouldUseCardLayout ? (
               <CardView

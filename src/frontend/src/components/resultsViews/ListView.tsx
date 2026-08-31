@@ -4,6 +4,7 @@ import { useSearchMode } from '../../contexts/SearchModeContext';
 import type { Book, ButtonStateInfo, DisplayField } from '../../types';
 import { bookSupportsTargets } from '../../utils/bookTargetLoader';
 import { getFormatColor, getLanguageColor } from '../../utils/colorMaps';
+import { shouldUseReleaseFlow } from '../../utils/shouldUseReleaseFlow';
 import { BookActionButton } from '../BookActionButton';
 import { BookTargetDropdown } from '../BookTargetDropdown';
 import { DisplayFieldIcon, DisplayFieldBadge } from '../shared';
@@ -128,9 +129,10 @@ export const ListView = ({
     >
       <div className="w-full divide-y divide-gray-200/60 dark:divide-gray-800/60">
         {books.map((book, index) => {
-          // Use appropriate button state function based on search mode
-          const buttonState =
-            searchMode === 'universal' ? getUniversalButtonState(book.id) : getButtonState(book.id);
+          // Button state must follow the same predicate as BookActionButton
+          const buttonState = shouldUseReleaseFlow(searchMode, book)
+            ? getUniversalButtonState(book.id)
+            : getButtonState(book.id);
           const isLoadingDetails = detailsLoadingId === book.id;
           const ratingField = book.display_fields?.find((field) => field.icon === 'star');
           const lengthField = book.display_fields?.find(

@@ -361,3 +361,149 @@ def test_get_bypassed_page_retries_next_mirror_after_runtime_error(monkeypatch):
         "https://mirror-one.example/book",
         "https://mirror-two.example/book",
     ]
+
+
+def test_get_cf_cookies_drops_domain_when_ddos_guard_cookie_expired():
+    """DDoS-Guard domains have no cf_clearance; __ddg8_/__ddg10_ gate access instead.
+
+    Anna's Archive moved from Cloudflare to DDoS-Guard in 2026-08. The old check only
+    looked at cf_clearance, so a domain protected by DDoS-Guard kept handing out its
+    ~20-minute cookies forever and every request paid a fresh browser solve anyway.
+    """
+    import time
+
+    import shelfmark.bypass.internal_bypasser as internal_bypasser
+
+    internal_bypasser.clear_cf_cookies()
+    internal_bypasser._cf_cookies["annas-archive.gl"] = {
+        "__ddg1_": {"value": "one", "expiry": None},
+        "__ddg8_": {"value": "eight", "expiry": int(time.time()) + 600},
+        "__ddg10_": {"value": "ten", "expiry": int(time.time()) + 600},
+    }
+
+    assert internal_bypasser.get_cf_cookies_for_domain("annas-archive.gl") == {
+        "__ddg1_": "one",
+        "__ddg8_": "eight",
+        "__ddg10_": "ten",
+    }
+
+    internal_bypasser._cf_cookies["annas-archive.gl"]["__ddg8_"]["expiry"] = int(time.time()) - 10
+
+    assert internal_bypasser.get_cf_cookies_for_domain("annas-archive.gl") == {}
+    assert "annas-archive.gl" not in internal_bypasser._cf_cookies
+    internal_bypasser.clear_cf_cookies()
+
+
+def test_get_cf_cookies_keeps_domain_when_non_gating_cookie_expired():
+    """Only access-gating cookies invalidate the whole entry."""
+    import time
+
+    import shelfmark.bypass.internal_bypasser as internal_bypasser
+
+    internal_bypasser.clear_cf_cookies()
+    internal_bypasser._cf_cookies["annas-archive.gl"] = {
+        "__ddgmark_": {"value": "mark", "expiry": int(time.time()) - 10},
+        "__ddg8_": {"value": "eight", "expiry": int(time.time()) + 600},
+    }
+
+    assert internal_bypasser.get_cf_cookies_for_domain("annas-archive.gl") == {
+        "__ddgmark_": "mark",
+        "__ddg8_": "eight",
+    }
+    internal_bypasser.clear_cf_cookies()
+
+
+class _Cookie:
+    """Minimal stand-in for a requests cookie."""
+
+    def __init__(self, name, value, expires=None, domain=None, path="/", secure=True):
+        self.name = name
+        self.value = value
+        self.expires = expires
+        self.domain = domain
+        self.path = path
+        self.secure = secure
+
+
+def test_refresh_cookies_extends_expiry_from_successful_traffic():
+    """Successful plain requests must keep the store alive, not only browser solves.
+
+    DDoS-Guard rotates __ddg8_/__ddg10_ on every response and expires them after
+    ~20 minutes. Without the write-back the stored expiry only ever tracked the last
+    browser solve, so get_cf_cookies_for_domain() threw away a cookie set that had
+    just been renewed - and paid another 20-67s solve for it.
+    """
+    import time
+
+    import shelfmark.bypass.internal_bypasser as internal_bypasser
+
+    internal_bypasser.clear_cf_cookies()
+    stale = int(time.time()) - 10
+    internal_bypasser._cf_cookies["annas-archive.gl"] = {
+        "__ddg8_": {"value": "old-eight", "expiry": stale, "path": "/", "secure": True},
+        "__ddg10_": {"value": "old-ten", "expiry": stale, "path": "/", "secure": True},
+    }
+
+    fresh = int(time.time()) + 1200
+    internal_bypasser.refresh_cookies_for_domain(
+        "https://annas-archive.gl/search?q=x",
+        [_Cookie("__ddg8_", "new-eight", expires=fresh), _Cookie("__ddg10_", "new-ten", fresh)],
+    )
+
+    assert internal_bypasser.get_cf_cookies_for_domain("annas-archive.gl") == {
+        "__ddg8_": "new-eight",
+        "__ddg10_": "new-ten",
+    }
+    internal_bypasser.clear_cf_cookies()
+
+
+def test_refresh_cookies_keeps_stored_expiry_when_response_has_none():
+    import time
+
+    import shelfmark.bypass.internal_bypasser as internal_bypasser
+
+    internal_bypasser.clear_cf_cookies()
+    expiry = int(time.time()) + 600
+    internal_bypasser._cf_cookies["annas-archive.gl"] = {
+        "__ddg8_": {"value": "old", "expiry": expiry},
+    }
+
+    internal_bypasser.refresh_cookies_for_domain(
+        "https://annas-archive.gl/", [_Cookie("__ddg8_", "new")]
+    )
+
+    stored = internal_bypasser._cf_cookies["annas-archive.gl"]["__ddg8_"]
+    assert stored["value"] == "new"
+    assert stored["expiry"] == expiry
+    internal_bypasser.clear_cf_cookies()
+
+
+def test_refresh_cookies_never_creates_state_for_an_unsolved_domain():
+    """Plain traffic may refresh bypass state, never establish it."""
+    import shelfmark.bypass.internal_bypasser as internal_bypasser
+
+    internal_bypasser.clear_cf_cookies()
+
+    internal_bypasser.refresh_cookies_for_domain(
+        "https://evil.example/", [_Cookie("__ddg8_", "value")]
+    )
+
+    assert internal_bypasser._cf_cookies == {}
+
+
+def test_refresh_cookies_ignores_non_protection_cookies():
+    """Full-session extraction stays browser-only; plain traffic touches protection cookies."""
+    import shelfmark.bypass.internal_bypasser as internal_bypasser
+
+    internal_bypasser.clear_cf_cookies()
+    internal_bypasser._cf_cookies["annas-archive.gl"] = {"__ddg8_": {"value": "old"}}
+
+    internal_bypasser.refresh_cookies_for_domain(
+        "https://annas-archive.gl/",
+        [_Cookie("session", "secret"), _Cookie("__ddg8_", "new")],
+    )
+
+    stored = internal_bypasser._cf_cookies["annas-archive.gl"]
+    assert set(stored) == {"__ddg8_"}
+    assert stored["__ddg8_"]["value"] == "new"
+    internal_bypasser.clear_cf_cookies()

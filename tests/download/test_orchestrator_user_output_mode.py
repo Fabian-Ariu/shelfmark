@@ -377,3 +377,59 @@ def test_queue_release_returns_error_for_operational_queue_failure(monkeypatch):
 
     assert success is False
     assert error == "Error queueing release: queue offline"
+
+
+def test_queue_release_rejects_audiobookbay_release_without_detail_url(monkeypatch):
+    """API clients can queue a metadata hit; reject it at submit time, not in the worker.
+
+    Production 2026-08-30 accepted source_id "audible:B00NWCPRBU" with source_url NULL
+    (user_id NULL, i.e. not from the browser) and the task only died later with
+    "Missing AudiobookBay details URL". A frontend-only guard cannot cover that caller.
+    """
+    import shelfmark.download.orchestrator as orchestrator
+    from shelfmark.release_sources.audiobookbay.handler import MISSING_DETAIL_URL_ERROR
+
+    monkeypatch.setattr(orchestrator.book_queue, "add", MagicMock())
+    monkeypatch.setattr(orchestrator, "ws_manager", None)
+
+    success, error = orchestrator.queue_release(
+        {
+            "source": "audiobookbay",
+            "source_id": "audible:B00NWCPRBU",
+            "title": "Project Hail Mary",
+            "content_type": "audiobook",
+        },
+    )
+
+    assert success is False
+    assert error == MISSING_DETAIL_URL_ERROR
+    orchestrator.book_queue.add.assert_not_called()
+
+
+def test_queue_release_accepts_audiobookbay_release_with_detail_url(monkeypatch):
+    import shelfmark.download.orchestrator as orchestrator
+
+    captured: dict[str, object] = {}
+
+    def fake_add(task):
+        captured["task"] = task
+        return True
+
+    monkeypatch.setattr(orchestrator.book_queue, "add", fake_add)
+    monkeypatch.setattr(orchestrator, "ws_manager", None)
+
+    success, error = orchestrator.queue_release(
+        {
+            "source": "audiobookbay",
+            "source_id": "abb-project-hail-mary",
+            "title": "Project Hail Mary",
+            "content_type": "audiobook",
+            "source_url": "https://audiobookbay.lu/abss/prokject-hail-mary-andy-weir/",
+        },
+    )
+
+    assert success is True
+    assert error is None
+    assert (
+        captured["task"].source_url == "https://audiobookbay.lu/abss/prokject-hail-mary-andy-weir/"
+    )

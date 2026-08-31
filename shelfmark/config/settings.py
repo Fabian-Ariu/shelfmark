@@ -1666,6 +1666,30 @@ def mirror_settings() -> list[SettingsField]:
             placeholder="https://your-aa-mirror.example",
             default=[],
         ),
+        NumberField(
+            key="AA_MAX_PAGES",
+            label="Search Result Pages",
+            description=(
+                "How many Anna's Archive result pages a search may fetch. Each extra page is "
+                "another request through the protection challenge, so higher values mean more "
+                "results but slower searches."
+            ),
+            default=5,
+            min_value=1,
+            max_value=20,
+        ),
+        NumberField(
+            key="AA_SEARCH_BUDGET_SECONDS",
+            label="Search Time Budget (seconds)",
+            description=(
+                "Stop fetching further result pages once a search has taken this long and "
+                "return what was already found. The first page is never skipped. 0 disables "
+                "the budget."
+            ),
+            default=90,
+            min_value=0,
+            max_value=600,
+        ),
         # === LIBGEN ===
         TagListField(
             key="LIBGEN_MIRROR_URLS",

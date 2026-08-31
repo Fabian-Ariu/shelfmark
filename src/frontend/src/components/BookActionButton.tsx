@@ -2,6 +2,7 @@ import type { CSSProperties } from 'react';
 
 import { useSearchMode } from '../contexts/SearchModeContext';
 import type { Book, ButtonStateInfo } from '../types';
+import { shouldUseReleaseFlow } from '../utils/shouldUseReleaseFlow';
 import { BookDownloadButton } from './BookDownloadButton';
 import { BookGetButton } from './BookGetButton';
 
@@ -35,7 +36,7 @@ export function BookActionButton({
 }: BookActionButtonProps) {
   const { searchMode } = useSearchMode();
 
-  if (searchMode === 'universal') {
+  if (shouldUseReleaseFlow(searchMode, book)) {
     return (
       <BookGetButton
         book={book}

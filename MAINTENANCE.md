@@ -42,6 +42,42 @@ Tests sichern beide Stellen:
 - `tests/contentTypeToSearchMode.test.ts` (Toggle-Klick-Pfad)
 - `tests/resolveEffectiveSearchMode.test.ts` (Dispatch-Override-Pfad)
 
+### Search-Mode: roh persistiert vs. content-type-aware abgeleitet (0.2.5, 2026-08-31)
+
+`App.tsx` hält **zwei** Werte:
+
+- `persistedSearchMode` — die rohe Nutzer-/Config-Präferenz
+  (`userSearchMode ?? config.search_mode ?? 'direct'`). **Nur dieser Wert** wird
+  im Search-Mode-Dropdown angezeigt (`AdvancedFilters`/`SearchSection`) und über
+  `handleSearchModeChange` nach LocalStorage + `SEARCH_MODE` zurückgeschrieben.
+  Auch `combinedModeAllowed` hängt daran (Combined erzwingt `contentType='ebook'`,
+  ein abgeleiteter Wert würde dort flackern).
+- `effectiveSearchMode = resolveEffectiveSearchMode(persistedSearchMode,
+  effectiveContentType)` — was die App *tut*. Speist `SearchModeProvider`,
+  Suchaufbau, Sort, Load-More, Provider-Auflösung.
+
+Damit folgt die UI derselben Regel wie der Dispatch in `useSearch.ts`. Es gibt
+**keinen** Rückschreibpfad von `effectiveSearchMode` nach `SEARCH_MODE`; ein
+Audiobook-Modus kann die persistierte eBook-Präferenz nicht überschreiben.
+
+Per-Book-Absicherung: `utils/shouldUseReleaseFlow.ts`
+(`searchMode === 'universal' || isMetadataBook(book)`) entscheidet in
+`BookActionButton`, `ResultsSection` und `ListView` über Release- vs.
+Direct-Aktion **und** über den Button-State. Diese drei müssen dasselbe Prädikat
+benutzen, sonst rendert ein Get-Button mit Direct-Button-State.
+
+Backend-Gegenstück (deckt API-Clients ab, die kein Frontend benutzen):
+`DownloadHandler.validate_queue_request(release_data, source_url)` — Default
+`None`. `AudiobookBayHandler` lehnt dort Releases ohne Detail-URL ab
+(`MISSING_DETAIL_URL_ERROR`), `orchestrator.queue_release` ruft den Hook vor dem
+Queuen auf. Bewusst **kein** Titel/Autor-Fallback: ein geratener Release wäre in
+der Request-Historie nicht von einer bewussten Auswahl zu unterscheiden.
+
+Tests: `tests/shouldUseReleaseFlow.test.ts`,
+`tests/audiobookbay/test_handler.py::TestAudiobookBayHandlerQueueValidation`,
+`tests/download/test_orchestrator_user_output_mode.py`
+(`test_queue_release_rejects_audiobookbay_release_without_detail_url`).
+
 ### Release-Source-Resolution ist content-type-aware (Block-B 2026-05-18, Patch 0.2.3)
 
 `getBrowseSource(book)` returnt `book.source || book.provider`. Im Direct-
@@ -82,11 +118,14 @@ Toggle:
 1. eBook-Suche in Direct-Mode → Ergebnisse stehen, `isInitialState=false`.
 2. Header-Toggle auf *Audiobook*: `useSearch` erzwingt intern `universal`
    (`resolveEffectiveSearchMode`), die Treffer sind Metadata-Books ohne
-   `book.source`. `effectiveSearchMode` in App.tsx ist **nicht**
-   content-type-aware und bleibt `direct` → `SearchModeContext` = `direct`.
+   `book.source`. **Seit 0.2.5 gilt dieselbe Regel auch für die UI** (siehe
+   Abschnitt unten) → `SearchModeContext` = `universal`, die Karte rendert den
+   Release-Pfad. Vorher blieb der Context auf `direct` und die Karte bot einen
+   Direct-Download an — das war BUG B.
 3. Header-Toggle zurück auf *Ebook*: `effectiveContentType='ebook'`,
    `SearchModeContext='direct'`, aber `books` sind noch die Audiobook-
-   Metadata-Books.
+   Metadata-Books. Dieser Restfall wird per-Book von `shouldUseReleaseFlow`
+   abgefangen (`isMetadataBook`), nicht mehr nur vom Modus.
 
 Die `SearchBar` ruft dabei zwar `onSearchModeChange` (das in `SearchSection`
 `resetSearchResultsState` auslöst), aber die Header-Instanz bekommt diesen Prop
@@ -220,13 +259,60 @@ sed -i.bak \
 
 Der Bind-Mount `direct_download_patched.py` muss nach jedem Upstream-Sync gegen
 die neue Source gediffed werden — sonst revertiert er Upstream-Aenderungen an
-`direct_download.py` zur Laufzeit:
+`direct_download.py` zur Laufzeit.
+
+**Seit 2026-08-31 sind Fork-Source und Bind-Mount byte-identisch**: die drei
+Patch-Familien (import os / Bypass-Leiter / Pagination-Loop) sind in die
+Fork-Source uebernommen. Der Diff ist damit die Erwartung:
 
 ```bash
-git show <neuer-tag>:shelfmark/release_sources/direct_download.py > /tmp/dd_new.py
-diff -u /tmp/dd_new.py ~/docker-migration/stacks/media-erweiterung/direct_download_patched.py
-# Erwartung: NUR die drei Patch-Familien (import os / CF-Bypass / Pagination-Loop)
+diff -u shelfmark/release_sources/direct_download.py \
+        ~/docker-migration/stacks/media-erweiterung/direct_download_patched.py
+# Erwartung: keine Ausgabe. Nach jeder Aenderung an direct_download.py:
+cp shelfmark/release_sources/direct_download.py \
+   ~/docker-migration/stacks/media-erweiterung/direct_download_patched.py
 ```
+
+Pagination-relevante Settings. Beide sind in `shelfmark/config/settings.py`
+(Tab *Mirrors*, Abschnitt Anna's Archive) als `NumberField` registriert, also in
+der Settings-UI sichtbar und per ENV ueberschreibbar wie jedes andere Setting:
+
+| Setting / ENV | Default | Wirkung |
+| --- | --- | --- |
+| `AA_MAX_PAGES` | 5 | Obergrenze der AA-Suchseiten pro Suche |
+| `AA_SEARCH_BUDGET_SECONDS` | 90 | Zeitbudget; ist es beim Start einer weiteren Seite ueberschritten, kommen Teilergebnisse zurueck. `0` schaltet es ab. Page 1 ist nie budgetiert (sonst 503 statt Treffer). |
+
+`_int_setting()` in `direct_download.py` liest beide ueber `config.get()` und
+faellt nur dann auf `os.environ` zurueck, wenn die Registry den Key nicht kennt.
+Dieser Fallback ist kein Stilbruch, sondern haelt die Bind-Mount-Datei auf einem
+aelteren Image funktionsfaehig: dort kennt die mitgelieferte Registry
+`AA_MAX_PAGES` noch nicht und `config.get()` wuerde still den Default liefern.
+
+Abbruchheuristik: der Loop stoppt, sobald eine Seite `_PAGE_LENGTH_SLACK` Zeilen
+kuerzer ist als die laengste bisher gesehene Seite — vorher zahlte jede Suche
+einen ueberfluessigen Leer-Fetch, also einen zusaetzlichen DDoS-Guard-Solve.
+Gezaehlt werden **von AA gelieferte** Ergebniszeilen (`_is_result_row()`, rein
+strukturell), nicht erfolgreich geparste Records: `_parse_search_result_row()`
+liefert regulaer `None` fuer Werbezeilen und fuer Zeilen ohne Publisher-/Jahr-/
+Sprach-Span, und eine einzige solche Zeile haette eine volle Seite als "kurz"
+erscheinen lassen. Die Seitengroesse wird gemessen, nicht angenommen — es gibt
+keine hartkodierte AA-Seitengroesse mehr.
+
+### VPN-Egress: der externe Bypasser waere ein Leck
+
+`cwa-downloader` haengt in `network_mode: service:gluetun`, jeder Request des
+Containers verlaesst die Maschine also ueber Mullvad. Der **interne** Bypasser
+startet Chrome als Subprozess im selben Namespace und ist damit ebenfalls gedeckt.
+
+Der **externe** Bypasser (FlareSolverr) ist ein eigener Container: aktiviert man
+`USING_EXTERNAL_BYPASSER`, wuerde der gesamte AA-Traffic ueber dessen Netzwerk
+laufen — und damit ueber die Heimleitung, nicht ueber Mullvad. Seit die
+AA-Aufrufe in `direct_download.py` (`search_books`, `get_book_info`,
+`/dyn/md5/summary`) mit `allow_bypasser_fallback=True` laufen, betrifft das auch
+den Suchpfad, der frueher nie beim Bypasser landete.
+
+Regel: `USING_EXTERNAL_BYPASSER` bleibt in diesem Stack aus. Wird es je gebraucht,
+muss der FlareSolverr-Container vorher selbst in den gluetun-Namespace.
 
 ## Incident response
 

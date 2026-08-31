@@ -110,6 +110,7 @@ import {
   applyDirectPolicyModeToButtonState,
   applyUniversalPolicyModeToButtonState,
 } from './utils/requestPolicyUi';
+import { resolveEffectiveSearchMode } from './utils/resolveEffectiveSearchMode';
 import {
   clearStoredSearchMode,
   getStoredSearchMode,
@@ -873,16 +874,27 @@ function App() {
     setUserSearchMode(getStoredSearchMode(username, null));
   }, [username]);
 
-  const effectiveSearchMode: SearchMode = userSearchMode ?? config?.search_mode ?? 'direct';
+  // ROH: die persistierte Nutzer-Praeferenz. Nur dieser Wert darf im
+  // Search-Mode-Dropdown angezeigt und (ueber handleSearchModeChange) nach
+  // LocalStorage/SEARCH_MODE zurueckgeschrieben werden.
+  const persistedSearchMode: SearchMode = userSearchMode ?? config?.search_mode ?? 'direct';
+  // AWARE: was die App tatsaechlich tut. Audiobook hat keinen Direct-Pfad
+  // (useSearch.ts erzwingt dasselbe am Dispatch) — die UI muss derselben Regel
+  // folgen, sonst rendert die Karte einen Direct-Download-Button fuer einen
+  // Metadata-Treffer und der Task stirbt im Backend ohne ABB-Detailseite.
+  const effectiveSearchMode: SearchMode = resolveEffectiveSearchMode(
+    persistedSearchMode,
+    effectiveContentType,
+  );
 
   // Combined mode requires universal mode, config enabled, and both content types accessible
   const combinedModeAllowed = useMemo(() => {
-    if (effectiveSearchMode !== 'universal') return false;
+    if (persistedSearchMode !== 'universal') return false;
     if (config?.show_combined_selector === false) return false;
     const ebookMode = getDefaultMode('ebook');
     const audiobookMode = getDefaultMode('audiobook');
     return ebookMode !== 'blocked' && audiobookMode !== 'blocked';
-  }, [effectiveSearchMode, config?.show_combined_selector, getDefaultMode]);
+  }, [persistedSearchMode, config?.show_combined_selector, getDefaultMode]);
   const effectiveCombinedMode = combinedMode && combinedModeAllowed;
   const effectiveCombinedState = effectiveCombinedMode ? combinedState : null;
 
@@ -2547,7 +2559,7 @@ function App() {
           defaultLanguage={defaultLanguageCodes}
           filters={advancedFilters}
           onFiltersChange={updateAdvancedFilters}
-          searchMode={effectiveSearchMode}
+          searchMode={persistedSearchMode}
           onSearchModeChange={handleSearchModeChange}
           metadataProviders={metadataProviders}
           activeMetadataProvider={effectiveMetadataProvider}
@@ -2599,7 +2611,7 @@ function App() {
             combinedMode={effectiveCombinedMode}
             onCombinedModeChange={combinedModeAllowed ? setCombinedMode : undefined}
             activeQueryField={activeQueryField}
-            searchMode={effectiveSearchMode}
+            searchMode={persistedSearchMode}
             onSearchModeChange={handleSearchModeChange}
             metadataProviders={metadataProviders}
             activeMetadataProvider={effectiveMetadataProvider}

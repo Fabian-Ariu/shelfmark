@@ -1,6 +1,6 @@
 """AudiobookBay download handler - resolves magnet links and uses shared client lifecycle."""
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 from urllib.parse import urlparse
 
 from shelfmark.core.config import config
@@ -26,6 +26,29 @@ if TYPE_CHECKING:
 logger = setup_logger(__name__)
 DEFAULT_ABB_HOSTNAME = "audiobookbay.lu"
 ALLOWED_DETAIL_URL_SCHEMES = {"https"}
+
+# Actionable rejection text. AudiobookBay resolves a magnet only from its detail
+# page; a metadata search result (e.g. source_id "audible:B00NWCPRBU") carries no
+# such URL and can never be downloaded. Production 2026-08-30 queued exactly that
+# payload from an API client and it died in the worker instead of at submit time.
+MISSING_DETAIL_URL_ERROR = (
+    "AudiobookBay downloads need the release detail page URL. "
+    "Search releases first (GET /api/releases?source=audiobookbay) and queue one of the "
+    "returned releases (its source_url), not a metadata search result."
+)
+
+
+def _pick_detail_url(source_url: str | None, task_id: str | None) -> str | None:
+    """Return the usable ABB detail URL from a source_url/task_id pair, if any."""
+    url = (source_url or "").strip()
+    if url:
+        return url
+
+    # Backward-compat: older tests and some legacy flows used task_id as URL.
+    candidate = (task_id or "").strip()
+    if candidate.startswith(("http://", "https://")):
+        return candidate
+    return None
 
 
 def _resolve_configured_hostname() -> str:
@@ -58,15 +81,26 @@ class AudiobookBayHandler(ExternalClientHandler):
     @staticmethod
     def _resolve_detail_url(task: DownloadTask) -> str | None:
         """Resolve ABB detail URL from queued task metadata."""
-        source_url = (task.source_url or "").strip()
-        if source_url:
-            return source_url
+        return _pick_detail_url(task.source_url, task.task_id)
 
-        # Backward-compat: older tests and some legacy flows used task_id as URL.
-        task_id = (task.task_id or "").strip()
-        if task_id.startswith(("http://", "https://")):
-            return task_id
-        return None
+    def validate_queue_request(
+        self,
+        release_data: dict[str, Any],
+        source_url: str | None,
+    ) -> str | None:
+        """Reject releases without a detail URL before they are queued.
+
+        Deliberately no search-based fallback: guessing a release from title/author
+        would queue a download the requester never saw (wrong edition, language, or
+        abridgement) and it would be indistinguishable from an approved pick in the
+        request history. Failing loudly at submit time is the honest behaviour, and
+        it is the only variant that also covers non-browser API clients.
+        """
+        source_id = release_data.get("source_id")
+        if _pick_detail_url(source_url, source_id if isinstance(source_id, str) else None):
+            return None
+        logger.warning("Rejected AudiobookBay release without details URL: %s", source_id)
+        return MISSING_DETAIL_URL_ERROR
 
     def _get_client(self, protocol: str) -> DownloadClient | None:
         """Compatibility shim so module-level patching still works in tests."""
@@ -84,7 +118,7 @@ class AudiobookBayHandler(ExternalClientHandler):
         """Resolve ABB detail page into a magnet-link download request."""
         detail_url = self._resolve_detail_url(task)
         if not detail_url:
-            status_callback("error", "Missing AudiobookBay details URL")
+            status_callback("error", MISSING_DETAIL_URL_ERROR)
             logger.warning("Missing details URL for AudiobookBay task: %s", task.task_id)
             return None
 

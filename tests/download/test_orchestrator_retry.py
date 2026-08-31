@@ -285,3 +285,124 @@ def test_get_book_data_clears_download_path_when_file_read_fails(monkeypatch, tm
     assert file_data is None
     assert returned_task is task
     assert task.download_path is None
+
+
+def test_retry_download_rejects_audiobookbay_task_without_detail_url(monkeypatch):
+    """The Retry button must not resurrect a payload queue_release would reject.
+
+    Production task "audible:B00NWCPRBU" (source audiobookbay, source_url NULL) passes
+    every retry guard because can_retry_without_staged_source defaults to True, so
+    without the handler hook it would be requeued and die in the worker again.
+    """
+    import shelfmark.download.orchestrator as orchestrator
+    from shelfmark.release_sources.audiobookbay.handler import MISSING_DETAIL_URL_ERROR
+
+    task = DownloadTask(
+        task_id="audible:B00NWCPRBU",
+        source="audiobookbay",
+        title="Project Hail Mary",
+        source_url=None,
+    )
+
+    mock_queue = MagicMock()
+    mock_queue.get_task.return_value = task
+    mock_queue.get_task_status.return_value = QueueStatus.ERROR
+    monkeypatch.setattr(orchestrator, "book_queue", mock_queue)
+    monkeypatch.setattr(orchestrator, "ws_manager", None)
+
+    ok, error = orchestrator.retry_download("audible:B00NWCPRBU")
+
+    assert ok is False
+    assert error == MISSING_DETAIL_URL_ERROR
+    mock_queue.enqueue_existing.assert_not_called()
+
+
+def test_retry_download_allows_audiobookbay_task_with_detail_url(monkeypatch):
+    import shelfmark.download.orchestrator as orchestrator
+
+    task = DownloadTask(
+        task_id="abb-project-hail-mary",
+        source="audiobookbay",
+        title="Project Hail Mary",
+        source_url="https://audiobookbay.lu/abss/project-hail-mary/",
+    )
+
+    mock_queue = MagicMock()
+    mock_queue.get_task.return_value = task
+    mock_queue.get_task_status.return_value = QueueStatus.ERROR
+    mock_queue.enqueue_existing.return_value = True
+    monkeypatch.setattr(orchestrator, "book_queue", mock_queue)
+    monkeypatch.setattr(orchestrator, "ws_manager", None)
+
+    ok, error = orchestrator.retry_download("abb-project-hail-mary")
+
+    assert ok is True
+    assert error is None
+    mock_queue.enqueue_existing.assert_called_once_with("abb-project-hail-mary", priority=-10)
+
+
+def test_retry_persisted_download_rejects_audiobookbay_row_without_detail_url(monkeypatch):
+    """Same guard for the history path, which rebuilds the task and calls add() directly."""
+    import shelfmark.download.orchestrator as orchestrator
+    from shelfmark.release_sources.audiobookbay.handler import MISSING_DETAIL_URL_ERROR
+
+    mock_queue = MagicMock()
+    monkeypatch.setattr(orchestrator, "book_queue", mock_queue)
+    monkeypatch.setattr(orchestrator, "ws_manager", None)
+
+    ok, error = orchestrator.retry_persisted_download(
+        {
+            "task_id": "audible:B00NWCPRBU",
+            "source": "audiobookbay",
+            "title": "Project Hail Mary",
+            "can_retry_without_staged_source": True,
+        },
+        final_status="error",
+    )
+
+    assert ok is False
+    assert error == MISSING_DETAIL_URL_ERROR
+    mock_queue.add.assert_not_called()
+
+
+def test_retry_persisted_download_allows_audiobookbay_row_with_detail_url(monkeypatch):
+    import shelfmark.download.orchestrator as orchestrator
+
+    mock_queue = MagicMock()
+    mock_queue.add.return_value = True
+    monkeypatch.setattr(orchestrator, "book_queue", mock_queue)
+    monkeypatch.setattr(orchestrator, "ws_manager", None)
+
+    ok, error = orchestrator.retry_persisted_download(
+        {
+            "task_id": "abb-project-hail-mary",
+            "source": "audiobookbay",
+            "title": "Project Hail Mary",
+            "source_url": "https://audiobookbay.lu/abss/project-hail-mary/",
+            "can_retry_without_staged_source": True,
+        },
+        final_status="error",
+    )
+
+    assert ok is True
+    assert error is None
+    mock_queue.add.assert_called_once()
+
+
+def test_retry_download_ignores_unknown_source_handler(monkeypatch):
+    """A removed handler must not turn into a retry error; that stays the worker's job."""
+    import shelfmark.download.orchestrator as orchestrator
+
+    task = DownloadTask(task_id="task-x", source="no-such-source", title="Gone")
+
+    mock_queue = MagicMock()
+    mock_queue.get_task.return_value = task
+    mock_queue.get_task_status.return_value = QueueStatus.ERROR
+    mock_queue.enqueue_existing.return_value = True
+    monkeypatch.setattr(orchestrator, "book_queue", mock_queue)
+    monkeypatch.setattr(orchestrator, "ws_manager", None)
+
+    ok, error = orchestrator.retry_download("task-x")
+
+    assert ok is True
+    assert error is None

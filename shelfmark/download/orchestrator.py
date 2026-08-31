@@ -243,6 +243,15 @@ def queue_release(
         if source_url == "":
             source_url = None
 
+        # Let the handler reject payloads it can never fulfil (e.g. an AudiobookBay
+        # release without its detail page URL). Without this the task is queued,
+        # possibly approved, and only dies in the worker -- and a frontend-only guard
+        # would not cover API clients at all.
+        queue_error = get_handler(source).validate_queue_request(release_data, source_url)
+        if queue_error:
+            logger.warning("Rejected queue request for source %s: %s", source, queue_error)
+            return False, queue_error
+
         # Get series info for library naming templates
         series_name = release_data.get("series_name") or extra.get("series_name")
         series_position = release_data.get("series_position") or extra.get("series_position")
@@ -354,6 +363,26 @@ def get_book_data(task_id: str) -> tuple[bytes | None, DownloadTask | None]:
         if task:
             task.download_path = None
         return None, task
+
+
+def _queue_request_error_for_task(task: DownloadTask) -> str | None:
+    """Run the handler's queue-time validation for an already-built task.
+
+    queue_release() validates the release payload before a task is created, but the
+    two retry paths (retry_download, retry_persisted_download) rebuild a task from the
+    queue/history and never pass through queue_release. Without this the exact payload
+    that was rejected at submit time can be resurrected by the Retry button and dies in
+    the worker again. Unknown/removed sources are not blocked here: retry of a task
+    whose handler is gone is a different failure and stays with the worker.
+    """
+    try:
+        handler = get_handler(task.source)
+    except ValueError:
+        return None
+    return handler.validate_queue_request(
+        {"source_id": task.task_id, "source": task.source},
+        task.source_url,
+    )
 
 
 def _has_staged_retry_source(task: DownloadTask) -> bool:
@@ -521,6 +550,11 @@ def retry_persisted_download(
         and not has_fresh_retry_context
     ):
         return False, "Download cannot be retried"
+
+    queue_error = _queue_request_error_for_task(task)
+    if queue_error:
+        logger.warning("Rejected retry for %s: %s", task.task_id, queue_error)
+        return False, queue_error
 
     task.priority = priority
     task.status_message = None
@@ -826,6 +860,11 @@ def retry_download(book_id: str) -> tuple[bool, str | None]:
 
     if not can_retry_download_task(task, status):
         return False, "Request-linked downloads must be retried from requests"
+
+    queue_error = _queue_request_error_for_task(task)
+    if queue_error:
+        logger.warning("Rejected retry for %s: %s", book_id, queue_error)
+        return False, queue_error
 
     task.last_error_message = None
     task.last_error_type = None

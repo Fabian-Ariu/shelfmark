@@ -144,6 +144,11 @@ const mapApiErrorToActionResult = (error: unknown): ActionResult | null => {
 // Default request timeout in milliseconds (30 seconds)
 const DEFAULT_TIMEOUT_MS = 30000;
 
+// Metadata provider lookups fan out to remote providers (combined_audiobook
+// queries Audible DE + Audible COM + Hardcover in parallel) and regularly need
+// more than the default budget.
+const METADATA_TIMEOUT_MS = 60000;
+
 // Utility function for JSON fetch with credentials and timeout
 async function fetchJSON<T>(
   url: string,
@@ -233,8 +238,13 @@ async function fetchJSON<T>(
 // API functions
 export const searchBooks = async (query: string): Promise<Book[]> => {
   if (!query) return [];
+  // Same endpoint as getReleases(): Anna's Archive full-text search can require
+  // a DDoS-Guard browser solve per page, which never fits the 30s default.
+  // Let the backend control timeouts here as well.
   const response = await fetchJSON<ReleasesResponse>(
     `${API_BASE}/releases?source=direct_download&${query}`,
+    {},
+    null,
   );
   return response.releases.map(transformReleaseToDirectBook);
 };
@@ -320,6 +330,8 @@ export const searchMetadata = async (
 
   const response = await fetchJSON<MetadataSearchResponse>(
     `${API.metadataSearch}?${params.toString()}`,
+    {},
+    METADATA_TIMEOUT_MS,
   );
 
   return {
@@ -465,8 +477,12 @@ export const setBookTargetState = async (
 };
 
 export const getSourceRecordInfo = async (source: string, id: string): Promise<Book> => {
+  // Hits the same Anna's Archive bypass path as searchBooks (get_book_info →
+  // /md5/<id>), so the 30s default would abort a healthy lookup.
   const response = await fetchJSON<SourceRecordData>(
     `${API_BASE}/release-sources/${encodeURIComponent(source)}/records/${encodeURIComponent(id)}`,
+    {},
+    null,
   );
   return transformSourceRecordToBook(response);
 };
@@ -475,6 +491,8 @@ export const getSourceRecordInfo = async (source: string, id: string): Promise<B
 export const getMetadataBookInfo = async (provider: string, bookId: string): Promise<Book> => {
   const response = await fetchJSON<MetadataBookData>(
     `${API_BASE}/metadata/book/${encodeURIComponent(provider)}/${encodeURIComponent(bookId)}`,
+    {},
+    METADATA_TIMEOUT_MS,
   );
 
   return transformMetadataToBook(response);

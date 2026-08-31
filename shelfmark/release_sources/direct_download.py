@@ -2,6 +2,7 @@
 
 import itertools
 import json
+import os
 import re
 import time
 from dataclasses import replace
@@ -46,6 +47,36 @@ if TYPE_CHECKING:
     from shelfmark.metadata_providers import BookMetadata
 
 logger = setup_logger(__name__)
+
+# Slack for the "a shorter page is the last page" heuristic in search_books().
+# AA's real page size is not hardcoded anywhere -- it is measured from the pages we
+# actually receive -- but a single malformed <tr> would still make a full page look
+# one row short. Being wrong in this direction costs one extra fetch; breaking too
+# early would silently truncate the result set, which is far worse.
+_PAGE_LENGTH_SLACK = 2
+
+# A result row carries at least this many <td>s; see _is_result_row().
+_RESULT_ROW_MIN_CELLS = 11
+
+
+def _int_setting(name: str, default: int, *, minimum: int) -> int:
+    """Read an int setting, preferring the settings registry over raw os.environ.
+
+    The registry (config.get) is the project-wide configuration path: UI-visible,
+    ENV-resolved, per-deployment. It is asked first. The os.environ fallback is not
+    decoration: this module is ALSO deployed as a runtime bind-mount patch over an
+    older image whose settings registry does not know these keys yet, and there
+    config.get() would silently return the default and ignore the AA_MAX_PAGES from
+    docker-compose. The fallback keeps the patched file honest on the old image and
+    is a no-op once the image carries the registered fields.
+    """
+    raw = config.get(name, None)
+    if raw is None:
+        raw = os.environ.get(name)
+    try:
+        return max(minimum, int(raw))
+    except ValueError, TypeError:
+        return default
 
 
 class SourcePriorityEntry(TypedDict):
@@ -382,45 +413,127 @@ def search_books(query: str, filters: SearchFilters) -> list[BrowseRecord]:
 
     selector = network.AAMirrorSelector()
 
-    url = (
-        f"{network.get_aa_base_url()}"
-        f"/search?index=&page=1&display=table"
-        f"&acc=aa_download&acc=external_download"
-        f"&ext={'&ext='.join(formats_to_use)}"
-        f"&q={query_html}"
-        f"{filters_query}"
-    )
+    # PAGINATION-PATCH 2026-05-04: hole bis zu AA_MAX_PAGES Pages, dedupe per ID.
+    # Eine Page, die deutlich kuerzer ist als die laengste bisher gesehene, ist die
+    # letzte -- die Page-Groesse wird gemessen, nicht angenommen.
+    max_pages = _int_setting("AA_MAX_PAGES", 5, minimum=1)
+    # ZEITBUDGET 2026-08-31: jede Page hinter DDoS-Guard kann einen Browser-Solve
+    # kosten (gemessen 20-67s pro Page). Ohne Budget laeuft eine breite Suche in den
+    # Server-Timeout und der Client bekommt gar nichts; mit Budget kommen die bereits
+    # geholten Seiten als Teilergebnis zurueck. Das Budget kann nur den START einer
+    # weiteren Page verhindern, nie einen laufenden Solve abbrechen -- der Worst Case
+    # bleibt Budget + eine Page-Dauer. 0 schaltet das Budget ab.
+    search_budget = _int_setting("AA_SEARCH_BUDGET_SECONDS", 90, minimum=0)
+    search_deadline = time.monotonic() + search_budget if search_budget > 0 else None
 
-    html = downloader.html_get_page(url, selector=selector, allow_bypasser_fallback=False)
-    if not html:
-        # Network/mirror exhaustion path bubbles up so API can notify clients
-        msg = "Unable to reach download source. Network restricted or mirrors are blocked."
-        raise SearchUnavailableError(msg)
+    all_books: list[BrowseRecord] = []
+    seen_ids: set[str] = set()
+    last_page_reached = 1
+    # Longest page seen so far, measured in result rows AA actually rendered. AA's
+    # page size is observed, never assumed, so the loop keeps working if AA changes
+    # it (or serves a different size in display=table mode).
+    max_page_rows = 0
 
-    if "No files found." in html:
-        logger.info("No books found for query: %s", query)
-        return []
+    for page in range(1, max_pages + 1):
+        # Page 1 is never budgeted: without it there is no result at all, and the
+        # caller needs the SearchUnavailableError path rather than an empty list.
+        if (
+            page > 1
+            and all_books
+            and search_deadline is not None
+            and time.monotonic() > search_deadline
+        ):
+            logger.info(
+                "AA search budget of %ss exhausted, stopping pagination at %d results",
+                search_budget,
+                len(all_books),
+            )
+            break
 
-    soup = BeautifulSoup(_html_response_text(html), "html.parser")
-    tbody = soup.find("table")
+        last_page_reached = page
+        url = (
+            f"{network.get_aa_base_url()}"
+            f"/search?index=&page={page}&display=table"
+            f"&acc=aa_download&acc=external_download"
+            f"&ext={'&ext='.join(formats_to_use)}"
+            f"&q={query_html}"
+            f"{filters_query}"
+        )
 
-    if tbody is None:
-        logger.warning("No results table found for query: %s", query)
-        msg = "No books found. Please try another query."
-        raise RuntimeError(msg)
-    if not isinstance(tbody, Tag):
-        msg = f"Expected results table tag, got {type(tbody).__name__}"
-        raise TypeError(msg)
+        # BYPASS-LEITER-FIX 2026-08-31: use_bypasser=True erzwang den Browser-Solve auf
+        # JEDER Seite (~60s, Chrome-Neustart pro Page) und uebersprang damit die Leiter in
+        # http.py: erst Plain-GET mit gecachten Bypass-Cookies, bei 403 Retry mit frischen
+        # Cookies, erst dann Browser. AA sitzt inzwischen hinter DDoS-Guard statt
+        # Cloudflare. allow_bypasser_fallback=True bleibt (Upstream-Default ist zwar True,
+        # aber der urspruengliche Suchpfad setzte hier explizit False).
+        html = downloader.html_get_page(url, selector=selector, allow_bypasser_fallback=True)
+        if not html:
+            if page == 1:
+                # Network/mirror exhaustion path bubbles up so API can notify clients
+                msg = "Unable to reach download source. Network restricted or mirrors are blocked."
+                raise SearchUnavailableError(msg)
+            logger.info(
+                "Page %d unreachable, stopping pagination at %d results", page, len(all_books)
+            )
+            break
 
-    books = []
-    for line_tr in tbody.find_all("tr"):
-        book = _parse_search_result_row(line_tr)
-        if book:
-            books.append(book)
+        if "No files found." in html:
+            if page == 1:
+                logger.info("No books found for query: %s", query)
+                return []
+            break
+
+        soup = BeautifulSoup(_html_response_text(html), "html.parser")
+        tbody = soup.find("table")
+
+        if tbody is None:
+            if page == 1:
+                logger.warning("No results table found for query: %s", query)
+                msg = "No books found. Please try another query."
+                raise RuntimeError(msg)
+            break
+        if not isinstance(tbody, Tag):
+            msg = f"Expected results table tag, got {type(tbody).__name__}"
+            raise TypeError(msg)
+
+        page_rows = 0
+        page_unique_count = 0
+        for line_tr in tbody.find_all("tr"):
+            # Count what AA SERVED, not what we managed to parse. _parse_search_result_row
+            # legitimately returns None for ad rows and for rows with an empty publisher,
+            # year or language span -- all common on AA. Counting parse successes would
+            # turn a full page into a "short" one and end pagination after page 1.
+            if _is_result_row(line_tr):
+                page_rows += 1
+            book = _parse_search_result_row(line_tr)
+            if not book:
+                continue
+            if book.id in seen_ids:
+                continue
+            seen_ids.add(book.id)
+            all_books.append(book)
+            page_unique_count += 1
+
+        # A page that is clearly shorter than the longest page seen is the last page.
+        # Without this every search paid one extra fetch of an empty page -- i.e. one
+        # extra DDoS-Guard solve. The comparison is against the OBSERVED page length
+        # plus slack, so neither AA's page size nor a stray unparsable row can cut a
+        # search short.
+        if page_unique_count == 0:
+            break
+        if page_rows + _PAGE_LENGTH_SLACK < max_page_rows:
+            logger.debug(
+                "Page %d returned %d of %d rows, treating it as the last page",
+                page,
+                page_rows,
+                max_page_rows,
+            )
+            break
+        max_page_rows = max(max_page_rows, page_rows)
 
     supported_formats = _get_supported_formats()
 
-    books.sort(
+    all_books.sort(
         key=lambda x: (
             supported_formats.index(x.format)
             if x.format in supported_formats
@@ -428,7 +541,13 @@ def search_books(query: str, filters: SearchFilters) -> list[BrowseRecord]:
         )
     )
 
-    return books
+    logger.info(
+        "search_books pagination: %d unique books across %d page(s) for '%s'",
+        len(all_books),
+        last_page_reached,
+        query,
+    )
+    return all_books
 
 
 def get_book_info(book_id: str, *, fetch_download_count: bool = True) -> BrowseRecord:
@@ -445,7 +564,8 @@ def get_book_info(book_id: str, *, fetch_download_count: bool = True) -> BrowseR
     """
     url = f"{network.get_aa_base_url()}/md5/{book_id}"
     selector = network.AAMirrorSelector()
-    html = downloader.html_get_page(url, selector=selector, allow_bypasser_fallback=False)
+    # BYPASS-LEITER-FIX 2026-08-31: siehe search_books
+    html = downloader.html_get_page(url, selector=selector, allow_bypasser_fallback=True)
 
     if not html:
         msg = "Unable to reach download source. Network restricted or mirrors are blocked."
@@ -456,6 +576,16 @@ def get_book_info(book_id: str, *, fetch_download_count: bool = True) -> BrowseR
     return _parse_book_info_page(soup, book_id, fetch_download_count=fetch_download_count)
 
 
+def _is_result_row(row: Tag) -> bool:
+    """Whether AA rendered this <tr> as a result row.
+
+    Structural gate only -- the same one _parse_search_result_row() applies, minus its
+    content checks. Used to measure how long a page is: over-counting costs at most one
+    extra fetch, under-counting would silently truncate the search.
+    """
+    return len(row.find_all("td")) >= _RESULT_ROW_MIN_CELLS and bool(row.find_all("a", href=True))
+
+
 def _parse_search_result_row(row: Tag) -> BrowseRecord | None:
     """Parse a single search result row into a browse record."""
     try:
@@ -464,7 +594,7 @@ def _parse_search_result_row(row: Tag) -> BrowseRecord | None:
 
         cells = row.find_all("td")
         anchors = row.find_all("a", href=True)
-        if len(cells) < 11 or not anchors:
+        if len(cells) < _RESULT_ROW_MIN_CELLS or not anchors:
             return None
 
         record_id = (_get_attr(anchors[0], "href") or "").split("/")[-1]
@@ -659,7 +789,7 @@ def _parse_book_info_page(
         try:
             summary_url = f"{network.get_aa_base_url()}/dyn/md5/summary/{book_id}"
             summary_response = downloader.html_get_page(
-                summary_url, selector=network.AAMirrorSelector(), allow_bypasser_fallback=False
+                summary_url, selector=network.AAMirrorSelector(), allow_bypasser_fallback=True
             )
             if summary_response:
                 summary_data = json.loads(_html_response_text(summary_response))

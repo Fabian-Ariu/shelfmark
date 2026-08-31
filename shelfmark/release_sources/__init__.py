@@ -394,6 +394,21 @@ class DownloadHandler(ABC):
         """Return private queue-time fields needed for restart-safe retry."""
         return {}
 
+    def validate_queue_request(
+        self,
+        release_data: dict[str, Any],
+        source_url: str | None,
+    ) -> str | None:
+        """Return an error message if this release can never be downloaded.
+
+        Called by the orchestrator before a task is queued. Handlers that need
+        more than ``source_id`` (e.g. a detail page URL) reject here so the caller
+        gets a synchronous, actionable error instead of a task that is queued,
+        possibly approved, and only then dies in the worker. Returning ``None``
+        (the default) means "no queue-time requirements".
+        """
+        return None
+
     @abstractmethod
     def cancel(self, task_id: str) -> bool:
         """Cancel an in-progress download."""

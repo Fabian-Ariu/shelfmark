@@ -11,7 +11,10 @@ from shelfmark.download.clients import (
     DownloadState,
     DownloadStatus,
 )
-from shelfmark.release_sources.audiobookbay.handler import AudiobookBayHandler
+from shelfmark.release_sources.audiobookbay.handler import (
+    MISSING_DETAIL_URL_ERROR,
+    AudiobookBayHandler,
+)
 
 
 class ProgressRecorder:
@@ -592,3 +595,59 @@ class TestAudiobookBayHandlerCancel:
         handler = AudiobookBayHandler()
         result = handler.cancel("test-task-id")
         assert result is False
+
+
+class TestAudiobookBayHandlerQueueValidation:
+    """Queue-time rejection of releases that can never resolve a magnet link."""
+
+    def test_accepts_release_with_detail_url(self):
+        handler = AudiobookBayHandler()
+        release_data = {
+            "source": "audiobookbay",
+            "source_id": "abb-project-hail-mary",
+            "title": "Project Hail Mary",
+        }
+
+        error = handler.validate_queue_request(
+            release_data,
+            "https://audiobookbay.lu/abss/prokject-hail-mary-andy-weir/",
+        )
+
+        assert error is None
+
+    def test_accepts_legacy_release_with_url_as_source_id(self):
+        """Older flows put the detail URL into source_id; keep those working."""
+        handler = AudiobookBayHandler()
+        release_data = {
+            "source": "audiobookbay",
+            "source_id": "https://audiobookbay.lu/abss/prokject-hail-mary-andy-weir/",
+            "title": "Project Hail Mary",
+        }
+
+        error = handler.validate_queue_request(release_data, None)
+
+        assert error is None
+
+    def test_rejects_metadata_result_without_detail_url(self):
+        """Production 2026-08-30: an Audible metadata hit was queued and died later.
+
+        source_id "audible:B00NWCPRBU", source_url NULL -> the handler could never
+        resolve a detail page, so the task must not be accepted in the first place.
+        """
+        handler = AudiobookBayHandler()
+        release_data = {
+            "source": "audiobookbay",
+            "source_id": "audible:B00NWCPRBU",
+            "title": "Project Hail Mary",
+        }
+
+        error = handler.validate_queue_request(release_data, None)
+
+        assert error == MISSING_DETAIL_URL_ERROR
+
+    def test_rejects_blank_detail_url(self):
+        handler = AudiobookBayHandler()
+
+        error = handler.validate_queue_request({"source_id": "   "}, "   ")
+
+        assert error == MISSING_DETAIL_URL_ERROR
