@@ -20,6 +20,10 @@ _user_db_module = None
 
 _SETTINGS_REFRESH_COOLDOWN_SECONDS = 0.05
 
+# Mirrors shelfmark.bypass.internal_bypasser._BYPASS_CHILD_ENV. Duplicated as a literal
+# on purpose: importing the bypass module here would be a circular import.
+_INTERNAL_BYPASSER_CHILD_ENV = "SHELFMARK_INTERNAL_BYPASSER_CHILD"
+
 
 def _get_registry() -> ModuleType:
     """Lazy import of settings registry to avoid circular imports."""
@@ -117,7 +121,13 @@ class Config:
         # On first load, sync ENV values to config files
         # This ensures ENV values persist even if ENV vars are later removed
         if not hasattr(self, "_env_synced"):
-            registry.sync_env_to_config()
+            # The browser-bypass helper subprocess reads config only. The app process
+            # already ran the sync and the migrations at startup, and get_setting_value()
+            # resolves ENV > config file > default regardless of the sync - so skipping it
+            # here keeps a second, unsynchronised writer out of /config (and saves the
+            # ~20 default files plus 8 rewrites on every single bypass solve).
+            if os.environ.get(_INTERNAL_BYPASSER_CHILD_ENV) != "1":
+                registry.sync_env_to_config()
             self._env_synced = True
 
         # Build field map from all registered tabs

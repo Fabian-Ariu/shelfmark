@@ -315,7 +315,10 @@ aelteren Image funktionsfaehig: dort kennt die mitgelieferte Registry
 `AA_MAX_PAGES` noch nicht und `config.get()` wuerde still den Default liefern.
 
 Bedarfsgesteuertes Nachladen (Browse-Pfad): `GET /api/releases?source=direct_download&...&page=N`
-holt genau Seite `N` ueber `search_books_page()` — ein Request, ein DDoS-Guard-Solve.
+holt genau Seite `N` ueber `search_books_page()` — ein Request, ein Solve. Seit dem
+gepoolten Bypass-Helfer (siehe "Interner Bypasser") ist dieser Solve billiger als
+frueher, aber er faellt weiterhin an: die Kostenrechnung "eine Seite = ein Solve"
+bleibt die richtige Obergrenze fuer die Planung.
 Die Antwort traegt zusaetzlich `page` und `has_more` (gleicher Contract wie
 `/api/metadata/search`); das Frontend haengt die Treffer an und dedupliziert per
 `book.id`. Der Sprach-Fallback (Retry ohne `lang`) laeuft nur auf Seite 1 und setzt
@@ -348,11 +351,128 @@ Fixtures modellieren 100). Frueher galt dort `Seite nicht leer => has_more`, was
 jedem Container-Restart (`gunicorn --workers 1`) die erste Suche mit einem Button auf
 eine garantiert leere Seite 2 schickte — 45-60 s Warten fuer nichts.
 
+### Interner Bypasser: gepoolter Helfer + warmer Browser
+
+Hoechstes Regressionsrisiko des Forks. Der Bypass-Pfad ist der **einzige** Weg zu
+Anna's Archive; geht er kaputt, funktionieren weder Suche noch Download. Es gibt
+keinen zweiten Pfad.
+
+**Aufbau.** Der gunicorn-Worker (`--workers 1`, gevent) startet Chrome nie selbst.
+Er startet einen Helfer-Subprozess (`python -m shelfmark.bypass.internal_bypasser`,
+`start_new_session=True`, also eigene Prozessgruppe), schickt ihm pro Solve eine
+JSON-Zeile auf stdin und pollt auf eine Ergebnisdatei in `/tmp`. Neu gegenueber
+frueher sind nur zwei Dinge: der Helfer bedient **mehrere** Requests statt einem,
+und er haelt **einen** Chrome ueber mehrere Solves warm. `LOCKED` serialisiert
+weiterhin prozessweit — zwei Suchen teilen sich den warmen Browser nie parallel.
+
+**Grenzwerte** (alle in `shelfmark/bypass/internal_bypasser.py`, Kopf der Datei,
+alle per ENV ueberschreibbar — Compose-ENV + Container-Restart genuegt, **kein**
+Image-Build):
+
+| ENV | Default | Wirkung |
+| --- | --- | --- |
+| `SHELFMARK_WARM_BROWSER_MAX_USES` | 12 | Seitenabrufe pro Chrome. **`=1` ist der Notschalter**: Browser wird vor dem zweiten Solve verworfen = Verhalten vor der Aenderung. |
+| `SHELFMARK_WARM_BROWSER_MAX_AGE_SECONDS` | 300 | Maximales Alter eines warmen Chrome |
+| `SHELFMARK_WARM_BROWSER_MAX_RSS_MB` | 300 | Chrome + Renderer darueber → ausmustern. `0` schaltet die Pruefung ab. `mem_limit` ist 512m. |
+| `SHELFMARK_BYPASS_HELPER_IDLE_SECONDS` | 60 | Danach reapt der Parent den untaetigen Helfer samt Browser |
+| `SHELFMARK_BYPASS_HELPER_MAX_AGE_SECONDS` | 900 | Maximales Alter des Helferprozesses |
+| `SHELFMARK_BYPASS_HELPER_MAX_REQUESTS` | 40 | Requests pro Helferprozess |
+
+**Gesundes Logbild** (`docker logs -f cwa-downloader`):
+
+```
+Started bypass helper process 1234
+Chrome browser ready (Pure CDP)
+Bypass successful using _bypass_method_cdp_gui_click
+Reusing warm Chrome browser (use 2/12, age 34s, chrome rss 180MB)
+Reusing warm Chrome browser (use 3/12, age 51s, chrome rss 196MB)
+Retiring warm Chrome browser: max uses reached (12)
+Bypass helper 1234 idle for 60s - releasing its browser
+Stopping bypass helper 1234 after 7 request(s), 210s alive
+```
+
+Genau **ein** "Chrome browser ready" pro Batch, danach aufsteigende `use N/12`.
+Die `chrome rss`-Zahl ist die Speicherkurve ueber die Wiederverwendungen — sie ist
+die einzige Spur, die ein OOM-Post-Mortem hat.
+
+**Krankes Logbild und was es heisst:**
+
+* `Warm Chrome produced nothing (attempt 1/10) - falling back to a fresh browser`
+  — einmal pro Batch ist normal (Sitzung war verbraucht). In Serie heisst es:
+  DDoS-Guard bewertet wiederverwendete Sitzungen negativ →
+  `SHELFMARK_WARM_BROWSER_MAX_USES=1` setzen und neu starten.
+* `Retiring warm Chrome browser: chrome rss 512MB over the 300MB limit` in Serie
+  — Chrome leckt. Kein Notfall (die Grenze greift ja), aber MAX_USES senken.
+* `Killing bypass helper process group 1234 (browser included)` — der Helfer hing
+  oder ist gestorben, ohne seinen Browser abzuraeumen. Vereinzelt ok.
+* `Bypass helper group 1234 survived SIGTERM - sending SIGKILL` — dito, haerter.
+* `Killing bypass helper 1234 without its process group` — `start_new_session` hat
+  nicht gegriffen, der Helfer teilt unsere Gruppe. Sollte nie vorkommen; dann
+  werden Chrome/Xvfb **nicht** mitgetoetet, Orphan-Gefahr.
+* `Pure CDP browser startup failed` in Serie — der klassische Vergiftungszustand:
+  verwaiste `chrome`/`chromium`/`Xvfb`. Pruefen und aufraeumen:
+  ```bash
+  docker exec cwa-downloader ps -eo pid,ppid,pgid,comm | grep -E 'chrome|Xvfb'
+  docker restart cwa-downloader   # sicherster Weg
+  ```
+
+**Warum der Helfer eine eigene Prozessgruppe hat.** Chrome (SeleniumBase,
+`asyncio.create_subprocess_exec`) und Xvfb (pyvirtualdisplay, `subprocess.Popen`)
+erben die Gruppe des Helfers. `shutdown()` schickt deshalb **immer** `SIGTERM`,
+dann `SIGKILL` an die Gruppe — auch dann, wenn der Python-Kindprozess bereits tot
+ist. Das ist der Fall, der frueher Orphans hinterliess: ein OOM-Kill trifft genau
+einen Prozess, das `finally` des Kindes laeuft nie, Chrome und Xvfb leben weiter.
+Die pgid wird direkt nach `Popen` gemerkt, weil `os.getpgid(pid)` nach dem Reap des
+Leaders fehlschlaegt, die Gruppe selbst aber weiterlebt, solange Mitglieder da sind.
+
+**Was das Methoden-Gedaechtnis ist.** Der Parent merkt sich pro Host+Challenge, welche
+Methode zuletzt getragen hat, und seedet damit jedes Kind. Das Kind verwirft einen
+Hint nach zwei Fehlschlaegen; sein Snapshot **ersetzt** deshalb den des Parents
+(`replace_bypass_method_hints`), er wird nicht dazugemergt. Sonst waere ein Hint
+unsterblich, weil `dict.update()` nie einen Schluessel entfernt.
+
+**Nicht anfassen ohne Messung:** der `solve_captcha()`-Shortcut greift nur bei
+`challenge_type == "ddos_guard"`. Auf echtem Cloudflare (welib.org, z-lib.fm) liefert
+SeleniumBase ebenfalls `False`, wenn keiner seiner ~15 Turnstile-Selektoren matcht —
+dort ist die 3-5s-Wartezeit danach der eigentliche Wirkmechanismus (die CF-JS laeuft
+in dieser Zeit fertig). Ebenso bleibt der eskalierende Backoff zwischen
+Methodenversuchen (`min(uniform(2,4)*try_count, 12)`) bewusst unangetastet: jede
+Methode klickt das Challenge-Widget, jeder Klick ist eine Verifikationsanfrage.
+
+**Bytecode-Precompile.** Das Dockerfile baut mit `uv sync --compile-bytecode` und
+`compileall /app/shelfmark` in Stage `base`; `FROM base AS shelfmark` erbt die
+`__pycache__`-Verzeichnisse. `PYTHONDONTWRITEBYTECODE=1` verhindert nur das
+*Schreiben* zur Laufzeit, nicht das Lesen. Nach jedem Build pruefen:
+
+```bash
+docker exec cwa-downloader find /app/.venv/lib -name '*.pyc' | head
+docker exec cwa-downloader find /app/shelfmark -name '*.pyc' | head
+```
+
+Beides muss Treffer liefern. Leer heisst: der Precompile-Schritt lief nicht, jeder
+Helferstart kompiliert seinen Importgraph wieder selbst (~2,5s pro Solve).
+
+**Pflicht vor dem Produktiv-Tag** (kein Unit-Test deckt das ab — die Suite laeuft
+komplett gegen einen FakeDriver, es hat dort noch nie ein echter Chrome gestartet):
+
+1. Laufendes Image sichern, sonst gibt es kein Rollback-Ziel:
+   ```bash
+   docker tag <aktuelles-image> shelfmark-fork:rollback-0.2.5
+   ```
+2. Wegwerf-Container fahren: `scripts/bypasser_permission_lab.sh`, darin drei
+   AA-Seiten nacheinander holen. Erwartet: genau **ein** `Chrome browser ready`,
+   danach `Reusing warm Chrome browser (use 2/12 ...)` und `use 3/12`, und am Ende
+   keine verwaisten `chrome`/`Xvfb` in `ps`.
+3. Precompile pruefen (Kommandos oben).
+4. Erst dann taggen und `deploy media-erweiterung up -d`.
+
 ### VPN-Egress: der externe Bypasser waere ein Leck
 
 `cwa-downloader` haengt in `network_mode: service:gluetun`, jeder Request des
 Containers verlaesst die Maschine also ueber Mullvad. Der **interne** Bypasser
-startet Chrome als Subprozess im selben Namespace und ist damit ebenfalls gedeckt.
+startet Chrome in einem Helfer-Subprozess im selben Namespace (siehe oben) und ist
+damit ebenfalls gedeckt — auch der ueber mehrere Solves warm gehaltene Browser, er
+lebt im selben Namespace wie der Helfer.
 
 Der **externe** Bypasser (FlareSolverr) ist ein eigener Container: aktiviert man
 `USING_EXTERNAL_BYPASSER`, wuerde der gesamte AA-Traffic ueber dessen Netzwerk

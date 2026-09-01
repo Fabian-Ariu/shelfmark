@@ -101,7 +101,7 @@ WORKDIR /app
 # Install core Python dependencies first for better layer caching
 COPY pyproject.toml uv.lock ./
 RUN --mount=type=cache,target=/root/.cache/uv \
-    uv sync --locked --no-default-groups
+    uv sync --locked --no-default-groups --compile-bytecode
 
 # Runtime dependencies are installed into /app/.venv during the build. Remove the
 # base image's system pip so stale installer CVEs do not ship in the final image.
@@ -114,6 +114,12 @@ RUN rm -rf \
 
 # Copy application code *after* dependencies are installed
 COPY . .
+
+# Pre-compile the application to .pyc at build time. PYTHONDONTWRITEBYTECODE=1 only
+# stops *writing* bytecode at runtime, it still reads what is already there - and
+# without this every bypass helper subprocess re-compiled the whole import graph
+# (seleniumbase, selenium, shelfmark) from source on each solve, ~2.5s a time.
+RUN PYTHONDONTWRITEBYTECODE=0 /app/.venv/bin/python -m compileall -q /app/shelfmark || true
 
 # Copy built frontend from frontend-builder stage
 COPY --from=frontend-builder /frontend/dist /app/frontend-dist
@@ -171,7 +177,7 @@ RUN apt-get update && \
 
 # Install the browser automation stack used by the full image
 RUN --mount=type=cache,target=/root/.cache/uv \
-    uv sync --locked --no-default-groups --extra browser
+    uv sync --locked --no-default-groups --extra browser --compile-bytecode
 
 # uv is only needed while building the image.
 RUN rm -f /usr/bin/uv /usr/bin/uvx
